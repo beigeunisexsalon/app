@@ -25,7 +25,26 @@ async function deleteKV(key) {
 
 const seed = {
   settings: {
-    salonName: "Beige Unisex Salon", gst: 5, footer: "Thank you for visiting!", membershipFee: 499, upiId: "",
+    salonName: "Beige Unisex Salon", gst: 5, footer: "Thank you for visiting!", upiId: "",
+    nextBillNo: 1001,
+    nextMembershipNo: 1,
+    membershipPlan: {
+      name: "Beige Rewards Membership",
+      price: 499,
+      validityDays: 365,
+      serviceDiscountPct: 5,
+      productDiscountPct: 0,
+      loyaltyMultiplier: 2,
+      birthdayDiscount: 100,
+      priorityBooking: true,
+      memberOnlyOffers: true,
+    },
+    loyalty: {
+      pointsPer100: 10,          // regular customers earn this many points per ₹100 spent
+      redemptionPointsPerRupee: 100, // 100 points = ₹1
+      minRedemption: 1000,
+      maxRedemptionPct: 20,      // max % of (discounted) bill that can be paid with points
+    },
     credentials: {
       Admin: { username: "admin", password: "admin123" },
       Reception: { username: "reception", password: "reception123" },
@@ -46,9 +65,9 @@ const seed = {
     { id: "e2", name: "Meena", role: "Beautician", phone: "9840033344", salary: 15000, commissionPct: 20 },
   ],
   customers: [
-    { id: "walkin", name: "Walk-in", phone: "-", birthday: "", gender: "Other", notes: "", allergies: "", membership: "", loyaltyPoints: 0, isWalkIn: true },
-    { id: "c1", name: "Sneha", phone: "9876543210", birthday: "1996-07-15", gender: "Female", notes: "", allergies: "", membership: "", loyaltyPoints: 12 },
-    { id: "c2", name: "Priya", phone: "9876500011", birthday: "1992-03-02", gender: "Female", notes: "", allergies: "", membership: "Member", loyaltyPoints: 40 },
+    { id: "walkin", name: "Walk-in", phone: "-", birthday: "", gender: "Other", notes: "", allergies: "", loyaltyPoints: 0, isWalkIn: true, membershipId: "", membershipStart: "", membershipExpiry: "", birthdayBenefitUsedYear: null },
+    { id: "c1", name: "Sneha", phone: "9876543210", birthday: "1996-07-15", gender: "Female", notes: "", allergies: "", loyaltyPoints: 120, membershipId: "", membershipStart: "", membershipExpiry: "", birthdayBenefitUsedYear: null },
+    { id: "c2", name: "Priya", phone: "9876500011", birthday: "1992-03-02", gender: "Female", notes: "", allergies: "", loyaltyPoints: 2540, membershipId: "BR-0001", membershipStart: todayISO(), membershipExpiry: addDays(todayISO(), 300), birthdayBenefitUsedYear: null },
   ],
   appointments: [
     { id: "a1", date: todayISO(), time: "09:00", customer: "Sneha", service: "Haircut", stylist: "Ravi Kumar", status: "pending" },
@@ -62,6 +81,7 @@ const seed = {
   ],
   expenses: [],
   bills: [],
+  pointsLedger: [],
 };
 
 function todayISO() { return new Date().toISOString().slice(0, 10); }
@@ -84,17 +104,37 @@ function formatPhoneIntl(phone) {
 function buildReceiptText(receipt, settings) {
   const lines = [
     `${settings.salonName}`,
-    `${receipt.date} — Bill for ${receipt.customer}`,
+    `Receipt #${receipt.billNo} · ${receipt.date} — Bill for ${receipt.customer}`,
     ...receipt.items.map((i) => `${i.name} x${i.qty}: ${rupee(i.price * i.qty)}`),
     `Subtotal: ${rupee(receipt.subtotal)}`,
+    receipt.membershipDiscount ? `Member discount: -${rupee(receipt.membershipDiscount)}` : null,
+    receipt.birthdayDiscount ? `Birthday discount: -${rupee(receipt.birthdayDiscount)}` : null,
+    receipt.loyaltyRedeemedValue ? `Loyalty redeemed (${receipt.loyaltyRedeemed} pts): -${rupee(receipt.loyaltyRedeemedValue)}` : null,
     receipt.discount ? `Discount: -${rupee(receipt.discount)}` : null,
     `GST: ${rupee(receipt.gst)}`,
     `TOTAL: ${rupee(receipt.total)}`,
     `Paid via ${receipt.paymentMethod}`,
+    receipt.pointsEarned ? `Loyalty points earned: +${receipt.pointsEarned}` : null,
     settings.footer,
   ].filter(Boolean);
   return lines.join("\n");
 }
+function isMemberActive(c, today) { return !!(c && c.membershipExpiry && c.membershipExpiry >= (today || todayISO())); }
+function membershipStatusLabel(c) {
+  if (!c || !c.membershipExpiry) return "None";
+  return isMemberActive(c) ? "Active" : "Expired";
+}
+function daysUntil(dateStr) {
+  if (!dateStr) return null;
+  const ms = new Date(dateStr) - new Date(todayISO());
+  return Math.round(ms / 86400000);
+}
+function isBirthdayMonth(birthday, today) {
+  if (!birthday) return false;
+  const t = today || todayISO();
+  return birthday.slice(5, 7) === t.slice(5, 7);
+}
+function redeemableValue(points, loyaltyCfg) { return Math.floor((points || 0) / (loyaltyCfg.redemptionPointsPerRupee || 100)); }
 
 export default function App() {
   const [data, setData] = useState(null);
@@ -118,11 +158,24 @@ export default function App() {
         const raw = await loadKV(STORAGE_KEY, true);
         const parsed = raw ? JSON.parse(raw) : seed;
         if (!parsed.customers.some((c) => c.id === "walkin")) {
-          parsed.customers.unshift({ id: "walkin", name: "Walk-in", phone: "-", birthday: "", gender: "Other", notes: "", allergies: "", membership: "", loyaltyPoints: 0, isWalkIn: true });
+          parsed.customers.unshift({ id: "walkin", name: "Walk-in", phone: "-", birthday: "", gender: "Other", notes: "", allergies: "", loyaltyPoints: 0, isWalkIn: true, membershipId: "", membershipStart: "", membershipExpiry: "", birthdayBenefitUsedYear: null });
         }
-        if (parsed.settings.membershipFee === undefined) parsed.settings.membershipFee = 499;
         if (parsed.settings.upiId === undefined) parsed.settings.upiId = "";
         if (!parsed.settings.credentials) parsed.settings.credentials = seed.settings.credentials;
+        if (!parsed.settings.membershipPlan) {
+          parsed.settings.membershipPlan = { ...seed.settings.membershipPlan, price: parsed.settings.membershipFee || seed.settings.membershipPlan.price };
+        }
+        if (!parsed.settings.loyalty) parsed.settings.loyalty = seed.settings.loyalty;
+        if (parsed.settings.nextBillNo === undefined) parsed.settings.nextBillNo = 1001;
+        if (parsed.settings.nextMembershipNo === undefined) parsed.settings.nextMembershipNo = 1;
+        if (!parsed.pointsLedger) parsed.pointsLedger = [];
+        parsed.customers.forEach((c) => {
+          if (c.membershipId === undefined) c.membershipId = c.membership === "Member" ? `BR-${String(Date.now()).slice(-4)}` : "";
+          if (c.membershipStart === undefined) c.membershipStart = "";
+          if (c.membershipExpiry === undefined) c.membershipExpiry = c.membership === "Member" ? addDays(todayISO(), 365) : "";
+          if (c.birthdayBenefitUsedYear === undefined) c.birthdayBenefitUsedYear = null;
+          if (c.loyaltyPoints === undefined) c.loyaltyPoints = 0;
+        });
         setData(parsed);
       } catch (e) {
         setData(seed);
@@ -168,6 +221,7 @@ export default function App() {
     { id: "billing", label: "Billing", icon: Receipt, roles: ["Admin", "Reception"] },
     { id: "bills", label: "All Bills", icon: FileText, roles: ["Admin", "Reception"] },
     { id: "customers", label: "Customers", icon: Users, roles: ["Admin", "Reception"] },
+    { id: "membership", label: "Membership", icon: Star, roles: ["Admin"] },
     { id: "inventory", label: "Inventory", icon: Package, roles: ["Admin"] },
     { id: "services", label: "Services", icon: Scissors, roles: ["Admin"] },
     { id: "employees", label: "Employees", icon: Briefcase, roles: ["Admin"] },
@@ -209,7 +263,8 @@ export default function App() {
         {activeTab === "appointments" && <Appointments data={data} update={update} openModal={setModal} notify={notify} />}
         {activeTab === "billing" && <Billing data={data} update={update} setReceipt={setReceipt} openModal={setModal} notify={notify} />}
         {activeTab === "bills" && <AllBills data={data} update={update} role={role} notify={notify} />}
-        {activeTab === "customers" && <Customers data={data} update={update} openModal={setModal} notify={notify} />}
+        {activeTab === "customers" && <Customers data={data} update={update} openModal={setModal} notify={notify} role={role} />}
+        {activeTab === "membership" && <MembershipDashboard data={data} />}
         {activeTab === "inventory" && <Inventory data={data} update={update} openModal={setModal} notify={notify} />}
         {activeTab === "services" && <Services data={data} update={update} openModal={setModal} notify={notify} />}
         {activeTab === "employees" && <Employees data={data} update={update} openModal={setModal} notify={notify} />}
@@ -221,7 +276,6 @@ export default function App() {
       {modal?.type === "customer" && (
         <CustomerModal
           initial={modal.payload}
-          membershipFee={data.settings.membershipFee}
           onClose={() => setModal(null)}
           onSave={(c) => {
             update((d) => {
@@ -250,10 +304,18 @@ export default function App() {
       )}
       {modal?.type === "expense" && (
         <ExpenseModal
+          initial={modal.payload}
           onClose={() => setModal(null)}
           onSave={(e) => {
-            update((d) => d.expenses.push({ ...e, id: uid("x") }));
-            notify("Expense added");
+            update((d) => {
+              if (modal.payload) {
+                const idx = d.expenses.findIndex((x) => x.id === modal.payload.id);
+                if (idx > -1) d.expenses[idx] = { ...d.expenses[idx], ...e };
+              } else {
+                d.expenses.push({ ...e, id: uid("x") });
+              }
+            });
+            notify(modal.payload ? "Expense updated" : "Expense added");
             setModal(null);
           }}
         />
@@ -466,25 +528,58 @@ function Billing({ data, update, setReceipt, openModal, notify }) {
   const [selected, setSelected] = useState({}); // serviceId -> qty
   const [products, setProducts] = useState({}); // productId -> qty
   const [addMembership, setAddMembership] = useState(false);
+  const [applyBirthday, setApplyBirthday] = useState(false);
+  const [redeemInput, setRedeemInput] = useState(0);
   const [staff, setStaff] = useState(data.employees[0]?.name || "");
   const [discount, setDiscount] = useState(0);
   const [payment, setPayment] = useState("Cash");
   const [stockWarning, setStockWarning] = useState("");
 
+  const plan = data.settings.membershipPlan;
+  const loyaltyCfg = data.settings.loyalty;
   const customer = data.customers.find((c) => c.id === customerId);
   const retailProducts = data.inventory.filter((p) => p.retail !== false);
-  const fee = data.settings.membershipFee || 0;
+  const isMember = isMemberActive(customer);
+  const canUseBirthday = isMember && customer && isBirthdayMonth(customer.birthday) && customer.birthdayBenefitUsedYear !== new Date().getFullYear();
 
   const serviceItems = data.services.filter((s) => selected[s.id] > 0)
     .map((s) => ({ type: "service", name: s.name, price: s.price, qty: selected[s.id] }));
   const productItems = retailProducts.filter((p) => products[p.id] > 0)
     .map((p) => ({ type: "product", name: p.name, price: p.sellingPrice, qty: products[p.id] }));
-  const membershipItem = addMembership ? [{ type: "membership", name: "Membership (1 yr)", price: fee, qty: 1 }] : [];
+  const isRenewal = isMember;
+  const membershipItem = addMembership ? [{ type: "membership", name: isRenewal ? `${plan.name} (renewal)` : `${plan.name} (new)`, price: plan.price, qty: 1 }] : [];
   const items = [...serviceItems, ...productItems, ...membershipItem];
 
+  const serviceSubtotal = serviceItems.reduce((s, i) => s + i.price * i.qty, 0);
+  const productSubtotal = productItems.reduce((s, i) => s + i.price * i.qty, 0);
   const subtotal = items.reduce((s, i) => s + i.price * i.qty, 0);
-  const gstAmt = Math.round(((subtotal - discount) * (data.settings.gst || 0)) / 100);
-  const total = Math.max(0, subtotal - discount) + gstAmt;
+
+  const membershipDiscountAmt = isMember
+    ? Math.round(serviceSubtotal * (plan.serviceDiscountPct || 0) / 100) + Math.round(productSubtotal * (plan.productDiscountPct || 0) / 100)
+    : 0;
+  const birthdayDiscountAmt = applyBirthday && canUseBirthday ? Math.min(plan.birthdayDiscount, subtotal) : 0;
+  const manualDiscount = Number(discount) || 0;
+
+  const availablePoints = customer?.loyaltyPoints || 0;
+  const preRedeemTotal = Math.max(0, subtotal - membershipDiscountAmt - birthdayDiscountAmt - manualDiscount);
+  const maxRedeemableRupees = Math.floor(preRedeemTotal * (loyaltyCfg.maxRedemptionPct || 0) / 100);
+  const maxRedeemablePoints = Math.min(availablePoints, maxRedeemableRupees * loyaltyCfg.redemptionPointsPerRupee);
+  const redeemPoints = Math.max(0, Math.min(Number(redeemInput) || 0, availablePoints));
+  const redeemValue = Math.floor(redeemPoints / (loyaltyCfg.redemptionPointsPerRupee || 100));
+  let redeemError = "";
+  if (redeemPoints > 0 && redeemPoints < loyaltyCfg.minRedemption) redeemError = `Minimum redemption is ${loyaltyCfg.minRedemption} points.`;
+  else if (redeemPoints > availablePoints) redeemError = "Not enough points available.";
+  else if (redeemValue > maxRedeemableRupees) redeemError = `Max redeemable on this bill is ${maxRedeemablePoints} points (${loyaltyCfg.maxRedemptionPct}% of bill).`;
+  const effectiveRedeemValue = redeemError ? 0 : redeemValue;
+  const effectiveRedeemPoints = redeemError ? 0 : redeemPoints;
+
+  const totalDiscount = membershipDiscountAmt + birthdayDiscountAmt + manualDiscount + effectiveRedeemValue;
+  const gstAmt = Math.round(Math.max(0, subtotal - totalDiscount) * (data.settings.gst || 0) / 100);
+  const total = Math.max(0, subtotal - totalDiscount) + gstAmt;
+
+  const eligibleSpend = Math.max(0, subtotal - totalDiscount); // basis for earning points (pre-GST)
+  const pointsRate = isMember ? (loyaltyCfg.pointsPer100 || 0) * (plan.loyaltyMultiplier || 1) : (loyaltyCfg.pointsPer100 || 0);
+  const pointsToEarn = Math.round((eligibleSpend / 100) * pointsRate);
 
   const toggleService = (id) => setSelected((s) => ({ ...s, [id]: s[id] ? 0 : 1 }));
   const setProductQty = (id, qty, max) => {
@@ -494,22 +589,39 @@ function Billing({ data, update, setReceipt, openModal, notify }) {
   };
 
   const generate = () => {
-    if (items.length === 0 || !customer) return;
+    if (items.length === 0 || !customer || redeemError) return;
+    const billNo = data.settings.nextBillNo;
     const bill = {
-      id: uid("b"), date: todayISO(), customer: customer.name, customerPhone: customer.phone,
-      items, discount: Number(discount) || 0, gst: gstAmt, subtotal, total,
-      paymentMethod: payment, staff,
+      id: uid("b"), billNo, date: todayISO(), customer: customer.name, customerId: customer.id, customerPhone: customer.phone,
+      items, discount: manualDiscount, membershipDiscount: membershipDiscountAmt, birthdayDiscount: birthdayDiscountAmt,
+      loyaltyRedeemed: effectiveRedeemPoints, loyaltyRedeemedValue: effectiveRedeemValue, pointsEarned: pointsToEarn,
+      gst: gstAmt, subtotal, total, paymentMethod: payment, staff,
     };
     update((d) => {
       d.bills.push(bill);
+      d.settings.nextBillNo = (d.settings.nextBillNo || 1001) + 1;
       const cust = d.customers.find((c) => c.id === customerId);
       if (cust) {
-        const earned = Math.floor(total / 100);
-        cust.loyaltyPoints = (cust.loyaltyPoints || 0) + earned;
+        let balance = cust.loyaltyPoints || 0;
+        if (effectiveRedeemPoints > 0) {
+          balance -= effectiveRedeemPoints;
+          d.pointsLedger.push({ id: uid("pl"), date: todayISO(), customerId: cust.id, customerName: cust.name, reason: `Redeemed on Bill #${billNo}`, points: -effectiveRedeemPoints, balanceAfter: balance, staff, billId: bill.id });
+        }
+        balance += pointsToEarn;
+        if (pointsToEarn > 0) {
+          d.pointsLedger.push({ id: uid("pl"), date: todayISO(), customerId: cust.id, customerName: cust.name, reason: `Bill #${billNo}`, points: pointsToEarn, balanceAfter: balance, staff, billId: bill.id });
+        }
+        cust.loyaltyPoints = balance;
+        if (applyBirthday && canUseBirthday) cust.birthdayBenefitUsedYear = new Date().getFullYear();
         if (addMembership) {
-          cust.membership = "Member";
-          cust.membershipSince = todayISO();
-          cust.membershipExpiry = addDays(todayISO(), 365);
+          if (!cust.membershipId) {
+            cust.membershipId = `BR-${String(d.settings.nextMembershipNo).padStart(4, "0")}`;
+            d.settings.nextMembershipNo = (d.settings.nextMembershipNo || 1) + 1;
+          }
+          const base = isMemberActive(cust) ? cust.membershipExpiry : todayISO();
+          if (!isMemberActive(cust)) cust.membershipStart = todayISO();
+          cust.membershipExpiry = addDays(base, plan.validityDays);
+          cust.membershipPlanName = plan.name;
         }
       }
       // Decrement retail products sold directly
@@ -524,7 +636,7 @@ function Billing({ data, update, setReceipt, openModal, notify }) {
       });
     });
     setReceipt(bill);
-    setSelected({}); setProducts({}); setDiscount(0); setAddMembership(false);
+    setSelected({}); setProducts({}); setDiscount(0); setAddMembership(false); setApplyBirthday(false); setRedeemInput(0);
   };
 
   return (
@@ -534,11 +646,18 @@ function Billing({ data, update, setReceipt, openModal, notify }) {
         <div className="billing-left">
           <label className="field-label">Customer <span className="req">*</span></label>
           <div className="row-2" style={{ gridTemplateColumns: "1fr auto" }}>
-            <select value={customerId} onChange={(e) => setCustomerId(e.target.value)}>
+            <select value={customerId} onChange={(e) => { setCustomerId(e.target.value); setRedeemInput(0); setApplyBirthday(false); }}>
               {data.customers.map((c) => <option key={c.id} value={c.id}>{c.name}{c.id === "walkin" ? "" : c.phone ? ` — ${c.phone}` : ""}</option>)}
             </select>
             <button type="button" className="btn-ghost" onClick={() => openModal({ type: "customer" })}><Plus size={13} />New</button>
           </div>
+
+          {isMember && (
+            <div className="member-banner">
+              <Star size={14} /> {plan.name} Member · {plan.serviceDiscountPct}% service discount applied
+              <span className="member-banner-sub">Renews {customer.membershipExpiry}{daysUntil(customer.membershipExpiry) <= 15 ? ` · expires in ${daysUntil(customer.membershipExpiry)}d` : ""}</span>
+            </div>
+          )}
 
           <label className="field-label" style={{ marginTop: 12 }}>Choose services</label>
           <div className="service-check-grid">
@@ -568,10 +687,28 @@ function Billing({ data, update, setReceipt, openModal, notify }) {
           )}
           {stockWarning && <div className="stock-warning">{stockWarning}</div>}
 
+          {availablePoints > 0 && (
+            <div className="loyalty-box">
+              <div className="loyalty-box-head">Loyalty points available: <b>{availablePoints}</b> ({rupee(redeemableValue(availablePoints, loyaltyCfg))})</div>
+              <div className="row-2" style={{ gridTemplateColumns: "1fr auto" }}>
+                <input type="number" min="0" placeholder="Points to redeem" value={redeemInput || ""} onChange={(e) => setRedeemInput(e.target.value)} />
+                <button type="button" className="btn-ghost" onClick={() => setRedeemInput(maxRedeemablePoints)}>Use max</button>
+              </div>
+              {redeemError ? <div className="stock-warning">{redeemError}</div> : redeemPoints > 0 && <div className="qr-note">Redeeming {redeemPoints} pts = -{rupee(redeemValue)}</div>}
+            </div>
+          )}
+
+          {canUseBirthday && (
+            <label className={"membership-toggle" + (applyBirthday ? " on" : "")}>
+              <input type="checkbox" checked={applyBirthday} onChange={(e) => setApplyBirthday(e.target.checked)} />
+              🎂<span>Apply birthday discount — {rupee(plan.birthdayDiscount)} (once a year)</span>
+            </label>
+          )}
+
           <label className={"membership-toggle" + (addMembership ? " on" : "")}>
             <input type="checkbox" checked={addMembership} onChange={(e) => setAddMembership(e.target.checked)} />
             <Star size={14} />
-            <span>Add / renew membership for {customer?.name || "this customer"} — {rupee(fee)}/year</span>
+            <span>{isMember ? "Renew" : "Buy"} {plan.name} for {customer?.name || "this customer"} — {rupee(plan.price)}{isMember ? ` (extends to ${addDays(customer.membershipExpiry, plan.validityDays)})` : ` (valid ${plan.validityDays} days)`}</span>
           </label>
 
           <label className="field-label" style={{ marginTop: 12 }}>Staff <span className="req">*</span></label>
@@ -599,10 +736,14 @@ function Billing({ data, update, setReceipt, openModal, notify }) {
             {items.length === 0 ? <div className="bs-empty">Nothing selected yet</div> :
               items.map((i, idx) => <div key={idx} className="bs-line"><span>{i.name}{i.qty > 1 ? ` ×${i.qty}` : ""}</span><span>{rupee(i.price * i.qty)}</span></div>)}
             <div className="bs-line"><span>Subtotal</span><span>{rupee(subtotal)}</span></div>
-            <div className="bs-line"><span>Discount</span><span>-{rupee(discount)}</span></div>
+            {membershipDiscountAmt > 0 && <div className="bs-line member-line"><span>Member discount ({plan.serviceDiscountPct}%)</span><span>-{rupee(membershipDiscountAmt)}</span></div>}
+            {birthdayDiscountAmt > 0 && <div className="bs-line member-line"><span>🎂 Birthday discount</span><span>-{rupee(birthdayDiscountAmt)}</span></div>}
+            {effectiveRedeemValue > 0 && <div className="bs-line member-line"><span>Loyalty redeemed ({effectiveRedeemPoints} pts)</span><span>-{rupee(effectiveRedeemValue)}</span></div>}
+            <div className="bs-line"><span>Discount</span><span>-{rupee(manualDiscount)}</span></div>
             <div className="bs-line"><span>GST ({data.settings.gst}%)</span><span>{rupee(gstAmt)}</span></div>
             <div className="bs-total"><span>Total</span><span>{rupee(total)}</span></div>
-            <button className="btn-primary full" disabled={items.length === 0 || !customer} onClick={generate}>Generate Bill</button>
+            {pointsToEarn > 0 && <div className="qr-note">Customer will earn {pointsToEarn} loyalty points on this bill{isMember ? ` (2× member rate)` : ""}.</div>}
+            <button className="btn-primary full" disabled={items.length === 0 || !customer || !!redeemError} onClick={generate}>Generate Bill</button>
           </div>
 
           {payment === "UPI" && total > 0 && (
@@ -611,7 +752,6 @@ function Billing({ data, update, setReceipt, openModal, notify }) {
                 <>
                   <div className="bs-title">Scan to pay</div>
                   <img className="qr-img" src={qrImageUrl(buildUpiLink(data.settings.upiId, data.settings.salonName, total, `Bill for ${customer?.name || "customer"}`))} alt="UPI payment QR code" />
-                  <div className="qr-fallback">{data.settings.upiId} · {rupee(total)}</div>
                   <div className="qr-note">Show this to the customer to scan and pay, then tap Generate Bill.</div>
                 </>
               ) : (
@@ -638,21 +778,25 @@ function ReceiptModal({ receipt, settings, onClose, notify }) {
         <button className="modal-close" onClick={onClose}><X size={16} /></button>
         <div className="receipt" id="print-area">
           <div className="receipt-brand">{settings.salonName}</div>
-          <div className="receipt-sub">{receipt.date} · {receipt.customer}</div>
+          <div className="receipt-sub">Receipt #{receipt.billNo} · {receipt.date}</div>
+          <div className="receipt-sub">{receipt.customer}</div>
           <hr />
           {receipt.items.map((i, idx) => (
             <div key={idx} className="receipt-line"><span>{i.name} x{i.qty}</span><span>{rupee(i.price * i.qty)}</span></div>
           ))}
           <hr />
           <div className="receipt-line"><span>Subtotal</span><span>{rupee(receipt.subtotal)}</span></div>
+          {receipt.membershipDiscount > 0 && <div className="receipt-line"><span>⭐ Member discount</span><span>-{rupee(receipt.membershipDiscount)}</span></div>}
+          {receipt.birthdayDiscount > 0 && <div className="receipt-line"><span>🎂 Birthday discount</span><span>-{rupee(receipt.birthdayDiscount)}</span></div>}
+          {receipt.loyaltyRedeemedValue > 0 && <div className="receipt-line"><span>Loyalty redeemed ({receipt.loyaltyRedeemed} pts)</span><span>-{rupee(receipt.loyaltyRedeemedValue)}</span></div>}
           <div className="receipt-line"><span>Discount</span><span>-{rupee(receipt.discount)}</span></div>
           <div className="receipt-line"><span>GST</span><span>{rupee(receipt.gst)}</span></div>
           <div className="receipt-total"><span>TOTAL</span><span>{rupee(receipt.total)}</span></div>
-          <div className="receipt-sub">Paid via {receipt.paymentMethod}</div>
+          <div className="receipt-line"><span>Payment mode</span><span>{receipt.paymentMethod}</span></div>
+          {receipt.pointsEarned > 0 && <div className="receipt-sub">Loyalty points earned: +{receipt.pointsEarned}</div>}
           {receipt.paymentMethod === "UPI" && settings.upiId && (
             <div className="qr-card" style={{ border: "none", boxShadow: "none", padding: "10px 0 0" }}>
               <img className="qr-img" src={qrImageUrl(buildUpiLink(settings.upiId, settings.salonName, receipt.total, `Bill for ${receipt.customer}`))} alt="UPI payment QR code" />
-              <div className="qr-fallback">{settings.upiId} · {rupee(receipt.total)}</div>
             </div>
           )}
           <div className="receipt-footer">{settings.footer}</div>
@@ -676,16 +820,34 @@ function ReceiptModal({ receipt, settings, onClose, notify }) {
 }
 
 /* ---------------- Customers ---------------- */
-function Customers({ data, update, openModal, notify }) {
+function Customers({ data, update, openModal, notify, role }) {
   const [q, setQ] = useState("");
   const [open, setOpen] = useState(null);
+  const [adjustFor, setAdjustFor] = useState(null);
+  const [adjustAmt, setAdjustAmt] = useState("");
+  const [adjustReason, setAdjustReason] = useState("");
   const list = data.customers.filter((c) => c.name.toLowerCase().includes(q.toLowerCase()) || c.phone.includes(q));
+  const plan = data.settings.membershipPlan;
+  const loyaltyCfg = data.settings.loyalty;
 
   const remove = (c) => {
     if (c.id === "walkin") return;
     if (!window.confirm(`Delete ${c.name}'s profile? This can't be undone.`)) return;
     update((d) => { d.customers = d.customers.filter((x) => x.id !== c.id); });
     notify("Customer deleted");
+  };
+
+  const submitAdjust = (c) => {
+    const amt = Number(adjustAmt);
+    if (!amt || !adjustReason.trim()) { notify("Enter an amount and a reason"); return; }
+    update((d) => {
+      const cust = d.customers.find((x) => x.id === c.id);
+      const balance = (cust.loyaltyPoints || 0) + amt;
+      cust.loyaltyPoints = Math.max(0, balance);
+      d.pointsLedger.push({ id: uid("pl"), date: todayISO(), customerId: c.id, customerName: c.name, reason: `Manual adjustment: ${adjustReason.trim()}`, points: amt, balanceAfter: cust.loyaltyPoints, staff: "Admin" });
+    });
+    notify("Points adjusted");
+    setAdjustFor(null); setAdjustAmt(""); setAdjustReason("");
   };
 
   return (
@@ -695,32 +857,79 @@ function Customers({ data, update, openModal, notify }) {
       } />
       <div className="search-row"><Search size={15} /><input placeholder="Search by name or phone" value={q} onChange={(e) => setQ(e.target.value)} /></div>
       <div className="cust-grid">
-        {list.map((c) => (
-          <div key={c.id} className="cust-card">
-            <div className="cust-top" onClick={() => setOpen(open === c.id ? null : c.id)} style={{ cursor: "pointer" }}>
-              <div className="cust-name">{c.name} {c.membership && <span className="badge">{c.membership}</span>}</div>
-              <div className="cust-phone">{c.phone}</div>
-            </div>
-            <div className="cust-meta" onClick={() => setOpen(open === c.id ? null : c.id)} style={{ cursor: "pointer" }}>{c.loyaltyPoints || 0} pts · {c.gender}</div>
-            <div className="cust-actions">
-              <button className="btn-ghost" onClick={() => openModal({ type: "customer", payload: c })}><Pencil size={12} />Edit</button>
-              {c.id !== "walkin" && <button className="btn-ghost danger" onClick={() => remove(c)}><Trash2 size={12} />Delete</button>}
-            </div>
-            {open === c.id && (
-              <div className="cust-detail">
-                {c.allergies && <div className="detail-row"><b>Allergies:</b> {c.allergies}</div>}
-                {c.notes && <div className="detail-row"><b>Notes:</b> {c.notes}</div>}
-                <div className="detail-row"><b>Birthday:</b> {c.birthday || "—"}</div>
-                {c.membership && <div className="detail-row"><b>Membership:</b> {c.membership} {c.membershipExpiry ? `(renews ${c.membershipExpiry})` : ""}</div>}
-                <div className="visit-title">Visit history</div>
-                {data.bills.filter((b) => b.customer === c.name).length === 0 ? <div className="bs-empty">No visits yet</div> :
-                  data.bills.filter((b) => b.customer === c.name).map((b) => (
-                    <div key={b.id} className="visit-row"><span>{b.date}</span><span>{b.items.map((i) => i.name).join(", ")}</span><span>{rupee(b.total)}</span></div>
-                  ))}
+        {list.map((c) => {
+          const bills = data.bills.filter((b) => b.customerId === c.id || b.customer === c.name);
+          const totalSpend = bills.reduce((s, b) => s + b.total, 0);
+          const status = membershipStatusLabel(c);
+          const dLeft = daysUntil(c.membershipExpiry);
+          const history = data.pointsLedger.filter((p) => p.customerId === c.id).slice().reverse();
+          return (
+            <div key={c.id} className="cust-card">
+              <div className="cust-top" onClick={() => setOpen(open === c.id ? null : c.id)} style={{ cursor: "pointer" }}>
+                <div className="cust-name">{c.name} {status === "Active" && <span className="badge">Member</span>}{status === "Expired" && <span className="badge badge-expired">Expired</span>}</div>
+                <div className="cust-phone">{c.phone}</div>
               </div>
-            )}
-          </div>
-        ))}
+              <div className="cust-meta" onClick={() => setOpen(open === c.id ? null : c.id)} style={{ cursor: "pointer" }}>{c.loyaltyPoints || 0} pts · {c.gender}</div>
+              <div className="cust-actions">
+                <button className="btn-ghost" onClick={() => openModal({ type: "customer", payload: c })}><Pencil size={12} />Edit</button>
+                {c.id !== "walkin" && <button className="btn-ghost danger" onClick={() => remove(c)}><Trash2 size={12} />Delete</button>}
+              </div>
+              {open === c.id && (
+                <div className="cust-detail">
+                  {c.allergies && <div className="detail-row"><b>Allergies:</b> {c.allergies}</div>}
+                  {c.notes && <div className="detail-row"><b>Notes:</b> {c.notes}</div>}
+                  <div className="detail-row"><b>Birthday:</b> {c.birthday || "—"}</div>
+                  <div className="detail-row"><b>Visits:</b> {bills.length} · <b>Total spend:</b> {rupee(totalSpend)}</div>
+
+                  <div className="mini-card">
+                    <div className="mini-card-title">Membership — {status}</div>
+                    {status === "None" ? (
+                      <div className="bs-empty">Not a member yet. Sell {plan.name} from Billing.</div>
+                    ) : (
+                      <>
+                        <div className="detail-row">{c.membershipPlanName || plan.name} · ID {c.membershipId}</div>
+                        <div className="detail-row">Started {c.membershipStart} → Renews {c.membershipExpiry}</div>
+                        {status === "Active" && dLeft <= 15 && <div className="detail-row expiring">Expires in {dLeft} day{dLeft === 1 ? "" : "s"}</div>}
+                        <div className="detail-row">{plan.serviceDiscountPct}% service discount · {plan.loyaltyMultiplier}× points while active</div>
+                      </>
+                    )}
+                  </div>
+
+                  <div className="mini-card">
+                    <div className="mini-card-title">Loyalty points</div>
+                    <div className="detail-row">Balance: <b>{c.loyaltyPoints || 0}</b> pts = {rupee(redeemableValue(c.loyaltyPoints, loyaltyCfg))}</div>
+                    {role === "Admin" && (
+                      adjustFor === c.id ? (
+                        <div className="adjust-row">
+                          <input type="number" placeholder="+/- points" value={adjustAmt} onChange={(e) => setAdjustAmt(e.target.value)} />
+                          <input placeholder="Reason (required)" value={adjustReason} onChange={(e) => setAdjustReason(e.target.value)} />
+                          <button className="btn-ghost" onClick={() => submitAdjust(c)}>Save</button>
+                          <button className="btn-ghost" onClick={() => setAdjustFor(null)}>Cancel</button>
+                        </div>
+                      ) : (
+                        <button className="btn-ghost" onClick={() => setAdjustFor(c.id)}><Pencil size={12} />Adjust points</button>
+                      )
+                    )}
+                    {history.length > 0 && (
+                      <>
+                        <div className="visit-title">Points history</div>
+                        {history.slice(0, 6).map((h) => (
+                          <div key={h.id} className="visit-row"><span>{h.date}</span><span>{h.reason}</span><span>{h.points > 0 ? "+" : ""}{h.points} → {h.balanceAfter}</span></div>
+                        ))}
+                      </>
+                    )}
+                  </div>
+
+                  <div className="visit-title">Visit history</div>
+                  {bills.length === 0 ? <div className="bs-empty">No visits yet</div> :
+                    bills.map((b) => (
+                      <div key={b.id} className="visit-row"><span>{b.date}</span><span>{b.items.map((i) => i.name).join(", ")}</span><span>{rupee(b.total)}</span></div>
+                    ))}
+                </div>
+              )}
+            </div>
+          );
+        })}
       </div>
     </div>
   );
@@ -840,21 +1049,32 @@ function Employees({ data, update, openModal, notify }) {
 }
 
 /* ---------------- Expenses ---------------- */
-function Expenses({ data, openModal }) {
+function Expenses({ data, update, openModal, notify }) {
   const month = todayISO().slice(0, 7);
   const monthTotal = data.expenses.filter((e) => e.date.slice(0, 7) === month).reduce((s, e) => s + Number(e.amount), 0);
+  const remove = (ex) => {
+    if (!window.confirm(`Delete this ${ex.category} expense of ${rupee(ex.amount)}?`)) return;
+    update((d) => { d.expenses = d.expenses.filter((x) => x.id !== ex.id); });
+    notify("Expense deleted");
+  };
   return (
     <div>
       <PageHead title="Expenses" sub={`This month: ${rupee(monthTotal)}`} action={
         <button className="btn-primary" onClick={() => openModal({ type: "expense" })}><Plus size={15} />New Expense</button>
       } />
       <table className="tbl">
-        <thead><tr><th>Date</th><th>Category</th><th>Note</th><th>Amount</th></tr></thead>
+        <thead><tr><th>Date</th><th>Category</th><th>Note</th><th>Amount</th><th></th></tr></thead>
         <tbody>
           {[...data.expenses].reverse().map((e) => (
-            <tr key={e.id}><td>{e.date}</td><td>{e.category}</td><td>{e.note}</td><td>{rupee(e.amount)}</td></tr>
+            <tr key={e.id}>
+              <td>{e.date}</td><td>{e.category}</td><td>{e.note}</td><td>{rupee(e.amount)}</td>
+              <td className="row-actions">
+                <button className="btn-ghost" onClick={() => openModal({ type: "expense", payload: e })}><Pencil size={12} /></button>
+                <button className="btn-ghost danger" onClick={() => remove(e)}><Trash2 size={12} /></button>
+              </td>
+            </tr>
           ))}
-          {data.expenses.length === 0 && <tr><td colSpan="4"><Empty text="No expenses logged yet." /></td></tr>}
+          {data.expenses.length === 0 && <tr><td colSpan="5"><Empty text="No expenses logged yet." /></td></tr>}
         </tbody>
       </table>
     </div>
@@ -874,9 +1094,26 @@ function AllBills({ data, update, role, notify }) {
   const totalShown = list.reduce((s, b) => s + b.total, 0);
 
   const remove = (b) => {
-    if (!window.confirm(`Delete this bill for ${b.customer} (${rupee(b.total)})? Stock already deducted will not be restored.`)) return;
-    update((d) => { d.bills = d.bills.filter((x) => x.id !== b.id); });
-    notify("Bill deleted");
+    if (!window.confirm(`Delete this bill for ${b.customer} (${rupee(b.total)})? Loyalty points from this bill will be reversed. Stock already deducted will not be restored.`)) return;
+    update((d) => {
+      d.bills = d.bills.filter((x) => x.id !== b.id);
+      if (b.customerId && (b.pointsEarned || b.loyaltyRedeemed)) {
+        const cust = d.customers.find((c) => c.id === b.customerId);
+        if (cust) {
+          let balance = cust.loyaltyPoints || 0;
+          if (b.pointsEarned) {
+            balance -= b.pointsEarned;
+            d.pointsLedger.push({ id: uid("pl"), date: todayISO(), customerId: cust.id, customerName: cust.name, reason: `Reversed: Bill #${b.billNo} deleted`, points: -b.pointsEarned, balanceAfter: balance, staff: "System" });
+          }
+          if (b.loyaltyRedeemed) {
+            balance += b.loyaltyRedeemed;
+            d.pointsLedger.push({ id: uid("pl"), date: todayISO(), customerId: cust.id, customerName: cust.name, reason: `Reversed: Bill #${b.billNo} deleted (points refunded)`, points: b.loyaltyRedeemed, balanceAfter: balance, staff: "System" });
+          }
+          cust.loyaltyPoints = Math.max(0, balance);
+        }
+      }
+    });
+    notify("Bill deleted and loyalty points reversed");
   };
 
   return (
@@ -968,24 +1205,147 @@ function Bar({ label, value, max }) {
   );
 }
 
+/* ---------------- Membership Dashboard ---------------- */
+function MembershipDashboard({ data }) {
+  const month = todayISO().slice(0, 7);
+  const plan = data.settings.membershipPlan;
+  const members = data.customers.filter((c) => c.membershipId);
+  const active = members.filter((c) => isMemberActive(c));
+  const expiringSoon = active.filter((c) => daysUntil(c.membershipExpiry) <= 15);
+  const expired = members.filter((c) => !isMemberActive(c));
+
+  const membershipBills = data.bills.filter((b) => b.items.some((i) => i.type === "membership"));
+  const membershipBillsMonth = membershipBills.filter((b) => b.date.slice(0, 7) === month);
+  const newThisMonth = membershipBillsMonth.filter((b) => b.items.some((i) => i.name.includes("(new)")));
+  const renewalsThisMonth = membershipBillsMonth.filter((b) => b.items.some((i) => i.name.includes("(renewal)")));
+  const membershipRevenue = membershipBillsMonth.reduce((s, b) => s + b.items.filter((i) => i.type === "membership").reduce((s2, i) => s2 + i.price * i.qty, 0), 0);
+
+  const ledgerMonth = data.pointsLedger.filter((p) => p.date.slice(0, 7) === month);
+  const issued = ledgerMonth.filter((p) => p.points > 0).reduce((s, p) => s + p.points, 0);
+  const redeemed = ledgerMonth.filter((p) => p.points < 0).reduce((s, p) => s + Math.abs(p.points), 0);
+
+  return (
+    <div>
+      <PageHead title="Membership" sub={`${plan.name} · ${rupee(plan.price)}/${plan.validityDays}d · ${plan.serviceDiscountPct}% discount · ${plan.loyaltyMultiplier}× points`} />
+      <div className="stat-grid">
+        <StatCard label="Total Members" value={members.length} tone="ink" />
+        <StatCard label="Active Members" value={active.length} tone="sage" />
+        <StatCard label="Expiring Soon (≤15d)" value={expiringSoon.length} tone={expiringSoon.length ? "brick" : "sage"} />
+        <StatCard label="Expired" value={expired.length} tone="brass" />
+      </div>
+      <div className="stat-grid">
+        <StatCard label="New This Month" value={newThisMonth.length} tone="brass" />
+        <StatCard label="Renewals This Month" value={renewalsThisMonth.length} tone="brass" />
+        <StatCard label="Membership Revenue" value={rupee(membershipRevenue)} tone="ink" />
+        <StatCard label="Points Issued / Redeemed" value={`${issued} / ${redeemed}`} tone="sage" />
+      </div>
+
+      <SectionCard title="Membership Report">
+        <table className="tbl">
+          <thead><tr><th>Customer</th><th>Plan</th><th>Status</th><th>Start</th><th>Expiry</th></tr></thead>
+          <tbody>
+            {members.length === 0 ? <tr><td colSpan="5"><Empty text="No memberships sold yet." /></td></tr> : members.map((c) => (
+              <tr key={c.id}>
+                <td>{c.name}</td><td>{c.membershipPlanName || plan.name}</td>
+                <td>{isMemberActive(c) ? <span className="tag sage">Active</span> : <span className="tag brick">Expired</span>}</td>
+                <td>{c.membershipStart}</td><td>{c.membershipExpiry}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </SectionCard>
+
+      <SectionCard title="Loyalty Report (this month)">
+        <table className="tbl">
+          <thead><tr><th>Date</th><th>Customer</th><th>Reason</th><th>Points</th><th>Balance</th></tr></thead>
+          <tbody>
+            {ledgerMonth.length === 0 ? <tr><td colSpan="5"><Empty text="No points activity this month." /></td></tr> :
+              [...ledgerMonth].reverse().map((p) => (
+                <tr key={p.id}>
+                  <td>{p.date}</td><td>{p.customerName}</td><td>{p.reason}</td>
+                  <td>{p.points > 0 ? "+" : ""}{p.points}</td><td>{p.balanceAfter}</td>
+                </tr>
+              ))}
+          </tbody>
+        </table>
+      </SectionCard>
+    </div>
+  );
+}
+
 /* ---------------- Settings ---------------- */
 function SettingsTab({ data, update }) {
   const s = data.settings;
+  const plan = s.membershipPlan;
+  const loyalty = s.loyalty;
   const set = (field, val) => update((d) => { d.settings[field] = val; });
+  const setPlan = (field, val) => update((d) => { d.settings.membershipPlan[field] = val; });
+  const setLoyalty = (field, val) => update((d) => { d.settings.loyalty[field] = val; });
+
   return (
     <div>
-      <PageHead title="Settings" sub="Salon profile & receipt" />
+      <PageHead title="Settings" sub="Salon profile, membership & staff access" />
+
       <SectionCard title="Salon profile">
-        <label className="field-label">Salon name</label>
-        <input value={s.salonName} onChange={(e) => set("salonName", e.target.value)} />
-        <label className="field-label">GST %</label>
-        <input type="number" value={s.gst} onChange={(e) => set("gst", Number(e.target.value))} />
+        <div className="profile-head">
+          <div className="profile-mark">{(s.salonName || "B").trim().charAt(0).toUpperCase()}</div>
+          <div className="profile-head-text">
+            <div className="profile-head-name">{s.salonName || "Your Salon"}</div>
+            <div className="profile-head-sub">GST {s.gst}% · Receipt #{s.nextBillNo} is next</div>
+          </div>
+        </div>
+        <div className="settings-grid">
+          <div>
+            <label className="field-label">Salon name</label>
+            <input value={s.salonName} onChange={(e) => set("salonName", e.target.value)} />
+          </div>
+          <div>
+            <label className="field-label">GST %</label>
+            <input type="number" value={s.gst} onChange={(e) => set("gst", Number(e.target.value))} />
+          </div>
+          <div>
+            <label className="field-label">UPI ID (for payment QR codes)</label>
+            <input placeholder="e.g. yoursalon@okhdfcbank" value={s.upiId} onChange={(e) => set("upiId", e.target.value)} />
+          </div>
+          <div>
+            <label className="field-label">Next receipt number</label>
+            <input type="number" value={s.nextBillNo} onChange={(e) => set("nextBillNo", Number(e.target.value))} />
+          </div>
+        </div>
         <label className="field-label">Receipt footer</label>
         <input value={s.footer} onChange={(e) => set("footer", e.target.value)} />
-        <label className="field-label">Membership fee (₹ / year)</label>
-        <input type="number" value={s.membershipFee} onChange={(e) => set("membershipFee", Number(e.target.value))} />
-        <label className="field-label">UPI ID (for payment QR codes)</label>
-        <input placeholder="e.g. yoursalon@okhdfcbank" value={s.upiId} onChange={(e) => set("upiId", e.target.value)} />
+      </SectionCard>
+
+      <SectionCard title="Membership plan">
+        <div className="empty" style={{ marginBottom: 12 }}>These values drive every membership sold in Billing — change them anytime, existing members keep the terms they signed up under.</div>
+        <label className="field-label">Plan name</label>
+        <input value={plan.name} onChange={(e) => setPlan("name", e.target.value)} />
+        <div className="settings-grid">
+          <div><label className="field-label">Price (₹)</label><input type="number" value={plan.price} onChange={(e) => setPlan("price", Number(e.target.value))} /></div>
+          <div><label className="field-label">Validity (days)</label><input type="number" value={plan.validityDays} onChange={(e) => setPlan("validityDays", Number(e.target.value))} /></div>
+          <div><label className="field-label">Service discount %</label><input type="number" value={plan.serviceDiscountPct} onChange={(e) => setPlan("serviceDiscountPct", Number(e.target.value))} /></div>
+          <div><label className="field-label">Product discount %</label><input type="number" value={plan.productDiscountPct} onChange={(e) => setPlan("productDiscountPct", Number(e.target.value))} /></div>
+          <div><label className="field-label">Loyalty multiplier (×)</label><input type="number" value={plan.loyaltyMultiplier} onChange={(e) => setPlan("loyaltyMultiplier", Number(e.target.value))} /></div>
+          <div><label className="field-label">Birthday discount (₹)</label><input type="number" value={plan.birthdayDiscount} onChange={(e) => setPlan("birthdayDiscount", Number(e.target.value))} /></div>
+        </div>
+        <label className="membership-toggle on" style={{ marginTop: 6 }}>
+          <input type="checkbox" checked={plan.priorityBooking} onChange={(e) => setPlan("priorityBooking", e.target.checked)} />
+          <span>Priority booking for members</span>
+        </label>
+        <label className="membership-toggle on">
+          <input type="checkbox" checked={plan.memberOnlyOffers} onChange={(e) => setPlan("memberOnlyOffers", e.target.checked)} />
+          <span>Member-only offers</span>
+        </label>
+      </SectionCard>
+
+      <SectionCard title="Loyalty points rules">
+        <div className="settings-grid">
+          <div><label className="field-label">Regular: points per ₹100 spent</label><input type="number" value={loyalty.pointsPer100} onChange={(e) => setLoyalty("pointsPer100", Number(e.target.value))} /></div>
+          <div><label className="field-label">Redemption: points per ₹1</label><input type="number" value={loyalty.redemptionPointsPerRupee} onChange={(e) => setLoyalty("redemptionPointsPerRupee", Number(e.target.value))} /></div>
+          <div><label className="field-label">Minimum redemption (points)</label><input type="number" value={loyalty.minRedemption} onChange={(e) => setLoyalty("minRedemption", Number(e.target.value))} /></div>
+          <div><label className="field-label">Max redemption (% of bill)</label><input type="number" value={loyalty.maxRedemptionPct} onChange={(e) => setLoyalty("maxRedemptionPct", Number(e.target.value))} /></div>
+        </div>
+        <div className="empty">Members earn {loyalty.pointsPer100 * plan.loyaltyMultiplier} points per ₹100 (regular customers earn {loyalty.pointsPer100}). {loyalty.redemptionPointsPerRupee} points = ₹1.</div>
       </SectionCard>
 
       <SectionCard title="Staff Logins">
@@ -1031,9 +1391,10 @@ function ModalShell({ title, onClose, children, onSave, saveLabel = "Save", disa
   );
 }
 
-function CustomerModal({ onClose, onSave, initial, membershipFee }) {
-  const [f, setF] = useState(initial ? { ...initial } : { name: "", phone: "", birthday: "", gender: "", notes: "", allergies: "", membership: "", loyaltyPoints: 0 });
+function CustomerModal({ onClose, onSave, initial }) {
+  const [f, setF] = useState(initial ? { ...initial } : { name: "", phone: "", birthday: "", gender: "", notes: "", allergies: "", loyaltyPoints: 0, membershipId: "", membershipStart: "", membershipExpiry: "", birthdayBenefitUsedYear: null });
   const isValid = f.name.trim().length > 0 && f.phone.trim().length >= 4 && f.gender;
+  const status = initial ? membershipStatusLabel(initial) : "None";
   return (
     <ModalShell
       title={initial ? "Edit Customer" : "New Customer"}
@@ -1063,11 +1424,11 @@ function CustomerModal({ onClose, onSave, initial, membershipFee }) {
       <label className="field-label">Notes (optional)</label>
       <textarea placeholder="Anything staff should know about this customer" value={f.notes} onChange={(e) => setF({ ...f, notes: e.target.value })} />
 
-      <label className={"membership-toggle" + (f.membership === "Member" ? " on" : "")}>
-        <input type="checkbox" checked={f.membership === "Member"} onChange={(e) => setF({ ...f, membership: e.target.checked ? "Member" : "" })} />
-        <Star size={14} />
-        <span>Enrolled as Member ({rupee(membershipFee || 499)}/year)</span>
-      </label>
+      {initial && (
+        <div className="qr-note" style={{ textAlign: "left" }}>
+          Membership: {status}{status !== "None" ? ` (${initial.membershipExpiry})` : ""} — sell or renew membership from the Billing screen.
+        </div>
+      )}
     </ModalShell>
   );
 }
@@ -1113,11 +1474,11 @@ function AppointmentModal({ data, onClose, onSave }) {
   );
 }
 
-function ExpenseModal({ onClose, onSave }) {
-  const [f, setF] = useState({ date: todayISO(), category: "Electricity", amount: "", note: "" });
+function ExpenseModal({ onClose, onSave, initial }) {
+  const [f, setF] = useState(initial ? { ...initial } : { date: todayISO(), category: "Electricity", amount: "", note: "" });
   const isValid = Number(f.amount) > 0;
   return (
-    <ModalShell title="New Expense" onClose={onClose} onSave={() => isValid && onSave({ ...f, amount: Number(f.amount) })} disabled={!isValid} hint="Amount is required.">
+    <ModalShell title={initial ? "Edit Expense" : "New Expense"} onClose={onClose} onSave={() => isValid && onSave({ ...f, amount: Number(f.amount) })} disabled={!isValid} hint="Amount is required.">
       <label className="field-label">Date</label>
       <input type="date" value={f.date} onChange={(e) => setF({ ...f, date: e.target.value })} />
       <label className="field-label">Category</label>
@@ -1439,14 +1800,37 @@ function Style() {
       .membership-toggle input { width:auto; margin:0; }
       .toast { position:fixed; bottom:24px; right:24px; background:var(--wine-deep); color:var(--cream); padding:12px 18px; border-radius:10px; display:flex; align-items:center; gap:8px; font-family:var(--font-ui); font-size:13px; font-weight:500; box-shadow:0 12px 30px rgba(42,34,38,.3); z-index:100; animation:toast-in .2s ease-out; }
       @keyframes toast-in { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:translateY(0); } }
+      .member-banner { display:flex; flex-direction:column; gap:2px; background:var(--wine-soft); border:1px solid var(--gold); border-radius:8px; padding:9px 12px; font-family:var(--font-ui); font-size:12.5px; font-weight:600; color:var(--wine-deep); margin:10px 0; }
+      .member-banner svg { display:inline; vertical-align:-2px; margin-right:4px; }
+      .member-banner-sub { font-size:10.5px; font-weight:500; color:var(--ink-soft); }
+      .loyalty-box { background:var(--paper); border:1px solid var(--line); border-radius:8px; padding:10px 12px; margin:10px 0; font-family:var(--font-ui); }
+      .loyalty-box-head { font-size:12px; margin-bottom:8px; color:var(--wine-deep); }
+      .bs-line.member-line { color:var(--wine-deep); font-weight:600; }
+      .mini-card { background:var(--paper); border:1px solid var(--line); border-radius:8px; padding:10px 12px; margin:8px 0; font-family:var(--font-ui); }
+      .mini-card-title { font-weight:700; font-size:11.5px; text-transform:uppercase; letter-spacing:.04em; color:var(--wine-deep); margin-bottom:6px; }
+      .detail-row.expiring { color:var(--rust); font-weight:600; }
+      .badge-expired { background:var(--line); color:var(--ink-soft); }
+      .adjust-row { display:flex; gap:6px; margin:8px 0; flex-wrap:wrap; }
+      .adjust-row input { flex:1; min-width:80px; padding:7px 9px; border:1px solid var(--line); border-radius:6px; font-size:12px; font-family:var(--font-ui); }
+      .settings-grid { display:grid; grid-template-columns:1fr 1fr; gap:0 14px; }
+      .settings-grid > div { display:flex; flex-direction:column; }
+      .profile-head { display:flex; align-items:center; gap:12px; margin-bottom:16px; padding-bottom:14px; border-bottom:1px solid var(--line); }
+      .profile-mark { width:44px; height:44px; border-radius:50%; background:var(--wine); color:var(--cream); font-family:var(--font-display); font-size:19px; font-weight:600; display:flex; align-items:center; justify-content:center; flex-shrink:0; }
+      .profile-head-name { font-family:var(--font-display); font-size:16px; font-weight:600; color:var(--wine-deep); }
+      .profile-head-sub { font-family:var(--font-ui); font-size:11.5px; color:var(--ink-soft); margin-top:2px; }
+      .login-row input { min-width:0; }
       @media print {
-        .modal-close, .btn-primary { display:none !important; }
+        body * { visibility:hidden; }
+        #print-area, #print-area * { visibility:visible; }
+        .modal-backdrop { position:static !important; background:none !important; inset:auto !important; display:block !important; }
+        .modal { position:static !important; box-shadow:none !important; width:auto !important; max-width:320px !important; max-height:none !important; padding:0 !important; margin:0 auto !important; }
+        #print-area { position:static !important; margin:0 auto; }
       }
       @media (max-width: 900px) {
         .app-shell { flex-direction:column; }
         .sidebar { width:100%; flex-direction:row; align-items:center; overflow-x:auto; }
         .nav { flex-direction:row; }
-        .stat-grid, .reports-grid, .cust-grid, .emp-grid, .service-check-grid { grid-template-columns:1fr; }
+        .stat-grid, .reports-grid, .cust-grid, .emp-grid, .service-check-grid, .settings-grid { grid-template-columns:1fr; }
         .billing-grid { grid-template-columns:1fr; }
       }
     `}</style>
