@@ -72,7 +72,6 @@ const seed = {
   appointments: [
     { id: "a1", date: todayISO(), time: "09:00", customer: "Sneha", service: "Haircut", stylist: "Ravi Kumar", status: "pending" },
     { id: "a2", date: todayISO(), time: "10:00", customer: "Priya", service: "Hair Spa", stylist: "Meena", status: "pending" },
-    { id: "a3", date: todayISO(), time: "11:30", customer: "Walk-in", service: "Haircut", stylist: "Ravi Kumar", status: "pending" },
   ],
   inventory: [
     { id: "p1", name: "Cadiveu Shampoo", stock: 15, min: 5, supplier: "Cadiveu", purchasePrice: 680, sellingPrice: 950, retail: true, linkedService: "", usagePerService: 0 },
@@ -135,6 +134,16 @@ function isBirthdayMonth(birthday, today) {
   return birthday.slice(5, 7) === t.slice(5, 7);
 }
 function redeemableValue(points, loyaltyCfg) { return Math.floor((points || 0) / (loyaltyCfg.redemptionPointsPerRupee || 100)); }
+function exportCSV(filename, headers, rows) {
+  const esc = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+  const csv = [headers.map(esc).join(","), ...rows.map((r) => headers.map((h) => esc(r[h])).join(","))].join("\n");
+  const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
 
 export default function App() {
   const [data, setData] = useState(null);
@@ -262,7 +271,7 @@ export default function App() {
         {activeTab === "dashboard" && <Dashboard data={data} setTab={setTab} openModal={setModal} />}
         {activeTab === "appointments" && <Appointments data={data} update={update} openModal={setModal} notify={notify} />}
         {activeTab === "billing" && <Billing data={data} update={update} setReceipt={setReceipt} openModal={setModal} notify={notify} />}
-        {activeTab === "bills" && <AllBills data={data} update={update} role={role} notify={notify} />}
+        {activeTab === "bills" && <AllBills data={data} />}
         {activeTab === "customers" && <Customers data={data} update={update} openModal={setModal} notify={notify} role={role} />}
         {activeTab === "membership" && <MembershipDashboard data={data} />}
         {activeTab === "inventory" && <Inventory data={data} update={update} openModal={setModal} notify={notify} />}
@@ -270,7 +279,7 @@ export default function App() {
         {activeTab === "employees" && <Employees data={data} update={update} openModal={setModal} notify={notify} />}
         {activeTab === "expenses" && <Expenses data={data} update={update} openModal={setModal} notify={notify} />}
         {activeTab === "reports" && <Reports data={data} />}
-        {activeTab === "settings" && <SettingsTab data={data} update={update} />}
+        {activeTab === "settings" && <SettingsTab data={data} update={update} notify={notify} />}
       </main>
 
       {modal?.type === "customer" && (
@@ -299,6 +308,16 @@ export default function App() {
             update((d) => d.appointments.push({ ...a, id: uid("a"), status: "pending" }));
             notify("Appointment added");
             setModal(null);
+          }}
+          onQuickAddCustomer={(c) => {
+            const id = uid("c");
+            update((d) => d.customers.push({
+              id, name: c.name.trim(), phone: c.phone.trim(), gender: c.gender,
+              birthday: "", notes: "", allergies: "", loyaltyPoints: 0,
+              membershipId: "", membershipStart: "", membershipExpiry: "", birthdayBenefitUsedYear: null,
+            }));
+            notify("Customer added");
+            return id;
           }}
         />
       )}
@@ -425,9 +444,11 @@ function Dashboard({ data, setTab, openModal }) {
   const todaysBills = data.bills.filter((b) => b.date === today);
   const sales = todaysBills.reduce((s, b) => s + b.total, 0);
   const apptsToday = data.appointments.filter((a) => a.date === today);
-  const walkins = apptsToday.filter((a) => a.customer === "Walk-in").length;
+  const walkins = todaysBills.filter((b) => b.customer === "Walk-in").length;
   const lowStock = data.inventory.filter((p) => p.stock <= p.min).length;
   const recent = [...data.bills].sort((a, b) => (b.date + b.id).localeCompare(a.date + a.id)).slice(0, 6);
+  const birthdays = data.customers.filter((c) => c.id !== "walkin" && c.birthday && isBirthdayMonth(c.birthday))
+    .sort((a, b) => a.birthday.slice(5, 10).localeCompare(b.birthday.slice(5, 10)));
 
   return (
     <div>
@@ -444,6 +465,30 @@ function Dashboard({ data, setTab, openModal }) {
         <button className="qa" onClick={() => openModal({ type: "customer" })}><Plus size={15} />New Customer</button>
         <button className="qa" onClick={() => openModal({ type: "expense" })}><Plus size={15} />Expenses</button>
       </div>
+      {birthdays.length > 0 && (
+        <SectionCard title={`🎂 Birthdays This Month (${birthdays.length})`}>
+          <div className="birthday-list">
+            {birthdays.map((c) => {
+              const phoneDigits = formatPhoneIntl(c.phone);
+              const canSend = phoneDigits.length >= 11;
+              const msg = `Hi ${c.name}, Happy Birthday from ${data.settings.salonName}! 🎉 Enjoy 10% off all services this month as our gift to you — we'd love to see you. Visit us soon!`;
+              return (
+                <div key={c.id} className="birthday-row">
+                  <div>
+                    <div className="birthday-name">{c.name}</div>
+                    <div className="birthday-date">{c.birthday.slice(5, 10)}</div>
+                  </div>
+                  {canSend ? (
+                    <a className="btn-ghost send-btn" style={{ flex: "none" }} href={`https://wa.me/${phoneDigits}?text=${encodeURIComponent(msg)}`} target="_blank" rel="noopener noreferrer">
+                      <MessageCircle size={13} />Send Wish
+                    </a>
+                  ) : <span className="qr-note">No phone on file</span>}
+                </div>
+              );
+            })}
+          </div>
+        </SectionCard>
+      )}
       <SectionCard title="Recent Transactions">
         {recent.length === 0 ? <Empty text="No bills yet — generate one from Billing." /> : (
           <table className="tbl">
@@ -646,9 +691,7 @@ function Billing({ data, update, setReceipt, openModal, notify }) {
         <div className="billing-left">
           <label className="field-label">Customer <span className="req">*</span></label>
           <div className="row-2" style={{ gridTemplateColumns: "1fr auto" }}>
-            <select value={customerId} onChange={(e) => { setCustomerId(e.target.value); setRedeemInput(0); setApplyBirthday(false); }}>
-              {data.customers.map((c) => <option key={c.id} value={c.id}>{c.name}{c.id === "walkin" ? "" : c.phone ? ` — ${c.phone}` : ""}</option>)}
-            </select>
+            <CustomerPicker customers={data.customers} value={customerId} onChange={(id) => { setCustomerId(id); setRedeemInput(0); setApplyBirthday(false); }} />
             <button type="button" className="btn-ghost" onClick={() => openModal({ type: "customer" })}><Plus size={13} />New</button>
           </div>
 
@@ -850,10 +893,28 @@ function Customers({ data, update, openModal, notify, role }) {
     setAdjustFor(null); setAdjustAmt(""); setAdjustReason("");
   };
 
+  const exportCustomers = () => {
+    const rows = data.customers.filter((c) => c.id !== "walkin").map((c) => {
+      const bills = data.bills.filter((b) => b.customerId === c.id || b.customer === c.name);
+      return {
+        Name: c.name, Phone: c.phone, Gender: c.gender, Birthday: c.birthday || "",
+        MembershipStatus: membershipStatusLabel(c), MembershipId: c.membershipId || "",
+        MembershipExpiry: c.membershipExpiry || "", LoyaltyPoints: c.loyaltyPoints || 0,
+        Visits: bills.length, TotalSpend: bills.reduce((s, b) => s + b.total, 0),
+      };
+    });
+    exportCSV("customers.csv",
+      ["Name", "Phone", "Gender", "Birthday", "MembershipStatus", "MembershipId", "MembershipExpiry", "LoyaltyPoints", "Visits", "TotalSpend"],
+      rows);
+  };
+
   return (
     <div>
       <PageHead title="Customers" sub={`${data.customers.length} profiles`} action={
-        <button className="btn-primary" onClick={() => openModal({ type: "customer" })}><Plus size={15} />New Customer</button>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button className="btn-ghost" onClick={exportCustomers}><FileText size={13} />Export CSV</button>
+          <button className="btn-primary" onClick={() => openModal({ type: "customer" })}><Plus size={15} />New Customer</button>
+        </div>
       } />
       <div className="search-row"><Search size={15} /><input placeholder="Search by name or phone" value={q} onChange={(e) => setQ(e.target.value)} /></div>
       <div className="cust-grid">
@@ -1082,58 +1143,34 @@ function Expenses({ data, update, openModal, notify }) {
 }
 
 /* ---------------- All Bills ---------------- */
-function AllBills({ data, update, role, notify }) {
+function AllBills({ data }) {
   const [q, setQ] = useState("");
   const [from, setFrom] = useState("");
   const [to, setTo] = useState("");
   const list = [...data.bills]
-    .filter((b) => (q ? b.customer.toLowerCase().includes(q.toLowerCase()) : true))
+    .filter((b) => (q ? (b.customer.toLowerCase().includes(q.toLowerCase()) || String(b.billNo).includes(q.trim())) : true))
     .filter((b) => (from ? b.date >= from : true))
     .filter((b) => (to ? b.date <= to : true))
     .sort((a, b) => (b.date + b.id).localeCompare(a.date + a.id));
   const totalShown = list.reduce((s, b) => s + b.total, 0);
 
-  const remove = (b) => {
-    if (!window.confirm(`Delete this bill for ${b.customer} (${rupee(b.total)})? Loyalty points from this bill will be reversed. Stock already deducted will not be restored.`)) return;
-    update((d) => {
-      d.bills = d.bills.filter((x) => x.id !== b.id);
-      if (b.customerId && (b.pointsEarned || b.loyaltyRedeemed)) {
-        const cust = d.customers.find((c) => c.id === b.customerId);
-        if (cust) {
-          let balance = cust.loyaltyPoints || 0;
-          if (b.pointsEarned) {
-            balance -= b.pointsEarned;
-            d.pointsLedger.push({ id: uid("pl"), date: todayISO(), customerId: cust.id, customerName: cust.name, reason: `Reversed: Bill #${b.billNo} deleted`, points: -b.pointsEarned, balanceAfter: balance, staff: "System" });
-          }
-          if (b.loyaltyRedeemed) {
-            balance += b.loyaltyRedeemed;
-            d.pointsLedger.push({ id: uid("pl"), date: todayISO(), customerId: cust.id, customerName: cust.name, reason: `Reversed: Bill #${b.billNo} deleted (points refunded)`, points: b.loyaltyRedeemed, balanceAfter: balance, staff: "System" });
-          }
-          cust.loyaltyPoints = Math.max(0, balance);
-        }
-      }
-    });
-    notify("Bill deleted and loyalty points reversed");
-  };
-
   return (
     <div>
       <PageHead title="All Bills" sub={`${list.length} bills · ${rupee(totalShown)} shown`} />
       <div className="filter-row">
-        <input placeholder="Search by customer" value={q} onChange={(e) => setQ(e.target.value)} />
+        <input placeholder="Search by customer or receipt #" value={q} onChange={(e) => setQ(e.target.value)} />
         <input type="date" value={from} onChange={(e) => setFrom(e.target.value)} title="From date" />
         <input type="date" value={to} onChange={(e) => setTo(e.target.value)} title="To date" />
         {(q || from || to) && <button className="btn-ghost" onClick={() => { setQ(""); setFrom(""); setTo(""); }}>Clear</button>}
       </div>
       <table className="tbl">
-        <thead><tr><th>Date</th><th>Customer</th><th>Staff</th><th>Items</th><th>Payment</th><th>Total</th>{role === "Admin" && <th></th>}</tr></thead>
+        <thead><tr><th>Receipt #</th><th>Date</th><th>Customer</th><th>Staff</th><th>Items</th><th>Payment</th><th>Total</th></tr></thead>
         <tbody>
           {list.map((b) => (
             <tr key={b.id}>
-              <td>{b.date}</td><td>{b.customer}</td><td>{b.staff}</td>
+              <td>{b.billNo}</td><td>{b.date}</td><td>{b.customer}</td><td>{b.staff}</td>
               <td>{b.items.map((i) => `${i.name} x${i.qty}`).join(", ")}</td>
               <td>{b.paymentMethod}</td><td>{rupee(b.total)}</td>
-              {role === "Admin" && <td><button className="btn-ghost danger" onClick={() => remove(b)}><Trash2 size={12} /></button></td>}
             </tr>
           ))}
           {list.length === 0 && <tr><td colSpan="7"><Empty text="No bills match these filters." /></td></tr>}
@@ -1145,15 +1182,25 @@ function AllBills({ data, update, role, notify }) {
 
 /* ---------------- Reports ---------------- */
 function Reports({ data }) {
-  const month = todayISO().slice(0, 7);
-  const monthBills = data.bills.filter((b) => b.date.slice(0, 7) === month);
-  const monthSales = monthBills.reduce((s, b) => s + b.total, 0);
-  const monthExpenses = data.expenses.filter((e) => e.date.slice(0, 7) === month).reduce((s, e) => s + Number(e.amount), 0);
-  const profit = monthSales - monthExpenses;
+  const [period, setPeriod] = useState("month"); // month | year | all
+  const [selMonth, setSelMonth] = useState(todayISO().slice(0, 7));
+  const [selYear, setSelYear] = useState(todayISO().slice(0, 4));
+
+  const inPeriod = (dateStr) => {
+    if (period === "month") return dateStr.slice(0, 7) === selMonth;
+    if (period === "year") return dateStr.slice(0, 4) === selYear;
+    return true;
+  };
+  const periodLabel = period === "month" ? selMonth : period === "year" ? selYear : "All-time";
+
+  const periodBills = data.bills.filter((b) => inPeriod(b.date));
+  const periodSales = periodBills.reduce((s, b) => s + b.total, 0);
+  const periodExpenses = data.expenses.filter((e) => inPeriod(e.date)).reduce((s, e) => s + Number(e.amount), 0);
+  const profit = periodSales - periodExpenses;
 
   const serviceAgg = {};
   const productAgg = {};
-  monthBills.forEach((b) => b.items.forEach((i) => {
+  periodBills.forEach((b) => b.items.forEach((i) => {
     const bucket = i.type === "product" ? productAgg : serviceAgg;
     bucket[i.name] = (bucket[i.name] || 0) + i.price * i.qty;
   }));
@@ -1161,30 +1208,58 @@ function Reports({ data }) {
   const topProducts = Object.entries(productAgg).sort((a, b) => b[1] - a[1]).slice(0, 5);
 
   const staffAgg = {};
-  monthBills.forEach((b) => { staffAgg[b.staff] = (staffAgg[b.staff] || 0) + b.total; });
+  periodBills.forEach((b) => { staffAgg[b.staff] = (staffAgg[b.staff] || 0) + b.total; });
   const topStaff = Object.entries(staffAgg).sort((a, b) => b[1] - a[1]).slice(0, 5);
 
   const payAgg = { Cash: 0, UPI: 0, Card: 0 };
-  monthBills.forEach((b) => { payAgg[b.paymentMethod] = (payAgg[b.paymentMethod] || 0) + b.total; });
+  periodBills.forEach((b) => { payAgg[b.paymentMethod] = (payAgg[b.paymentMethod] || 0) + b.total; });
+
+  const exportBills = () => {
+    const rows = periodBills.map((b) => ({
+      ReceiptNo: b.billNo, Date: b.date, Customer: b.customer, Staff: b.staff,
+      Items: b.items.map((i) => `${i.name} x${i.qty}`).join("; "),
+      Subtotal: b.subtotal, Discount: b.discount, MembershipDiscount: b.membershipDiscount || 0,
+      LoyaltyRedeemed: b.loyaltyRedeemedValue || 0, GST: b.gst, Total: b.total,
+      PaymentMode: b.paymentMethod, PointsEarned: b.pointsEarned || 0,
+    }));
+    exportCSV(`bills_${periodLabel}.csv`,
+      ["ReceiptNo", "Date", "Customer", "Staff", "Items", "Subtotal", "Discount", "MembershipDiscount", "LoyaltyRedeemed", "GST", "Total", "PaymentMode", "PointsEarned"],
+      rows);
+  };
 
   return (
     <div>
-      <PageHead title="Reports" sub={`Month of ${month}`} />
+      <PageHead title="Reports" sub={`Showing: ${periodLabel}`} action={
+        <div className="reports-controls">
+          <select value={period} onChange={(e) => setPeriod(e.target.value)}>
+            <option value="month">Month</option>
+            <option value="year">Year</option>
+            <option value="all">All-time</option>
+          </select>
+          {period === "month" && <input type="month" value={selMonth} onChange={(e) => setSelMonth(e.target.value)} />}
+          {period === "year" && (
+            <select value={selYear} onChange={(e) => setSelYear(e.target.value)}>
+              {Array.from({ length: 6 }, (_, i) => String(Number(todayISO().slice(0, 4)) - i)).map((y) => <option key={y} value={y}>{y}</option>)}
+            </select>
+          )}
+          <button className="btn-primary" onClick={exportBills}><FileText size={14} />Export CSV</button>
+        </div>
+      } />
       <div className="stat-grid">
-        <StatCard label="Month Sales" value={rupee(monthSales)} tone="ink" />
-        <StatCard label="Month Expenses" value={rupee(monthExpenses)} tone="brick" />
+        <StatCard label="Sales" value={rupee(periodSales)} tone="ink" />
+        <StatCard label="Expenses" value={rupee(periodExpenses)} tone="brick" />
         <StatCard label="Profit" value={rupee(profit)} tone={profit >= 0 ? "sage" : "brick"} />
-        <StatCard label="Bills this month" value={monthBills.length} tone="brass" />
+        <StatCard label="Bills" value={periodBills.length} tone="brass" />
       </div>
       <div className="reports-grid">
         <SectionCard title="Top Services">
-          {topServices.length === 0 ? <Empty text="No sales this month yet." /> : topServices.map(([name, val]) => <Bar key={name} label={name} value={val} max={topServices[0][1]} />)}
+          {topServices.length === 0 ? <Empty text="No sales in this period yet." /> : topServices.map(([name, val]) => <Bar key={name} label={name} value={val} max={topServices[0][1]} />)}
         </SectionCard>
         <SectionCard title="Top Retail Products">
-          {topProducts.length === 0 ? <Empty text="No retail sales this month yet." /> : topProducts.map(([name, val]) => <Bar key={name} label={name} value={val} max={topProducts[0][1]} />)}
+          {topProducts.length === 0 ? <Empty text="No retail sales in this period yet." /> : topProducts.map(([name, val]) => <Bar key={name} label={name} value={val} max={topProducts[0][1]} />)}
         </SectionCard>
         <SectionCard title="Top Employees">
-          {topStaff.length === 0 ? <Empty text="No sales this month yet." /> : topStaff.map(([name, val]) => <Bar key={name} label={name} value={val} max={topStaff[0][1]} />)}
+          {topStaff.length === 0 ? <Empty text="No sales in this period yet." /> : topStaff.map(([name, val]) => <Bar key={name} label={name} value={val} max={topStaff[0][1]} />)}
         </SectionCard>
         <SectionCard title="Payment Breakdown">
           {Object.entries(payAgg).map(([name, val]) => <Bar key={name} label={name} value={val} max={Math.max(1, ...Object.values(payAgg))} />)}
@@ -1274,13 +1349,24 @@ function MembershipDashboard({ data }) {
 }
 
 /* ---------------- Settings ---------------- */
-function SettingsTab({ data, update }) {
-  const s = data.settings;
-  const plan = s.membershipPlan;
-  const loyalty = s.loyalty;
-  const set = (field, val) => update((d) => { d.settings[field] = val; });
-  const setPlan = (field, val) => update((d) => { d.settings.membershipPlan[field] = val; });
-  const setLoyalty = (field, val) => update((d) => { d.settings.loyalty[field] = val; });
+function SettingsTab({ data, update, notify }) {
+  const [draft, setDraft] = useState(() => structuredClone(data.settings));
+  const [dirty, setDirty] = useState(false);
+  const s = draft;
+  const plan = draft.membershipPlan;
+  const loyalty = draft.loyalty;
+
+  const set = (field, val) => { setDraft((d) => ({ ...d, [field]: val })); setDirty(true); };
+  const setPlan = (field, val) => { setDraft((d) => ({ ...d, membershipPlan: { ...d.membershipPlan, [field]: val } })); setDirty(true); };
+  const setLoyalty = (field, val) => { setDraft((d) => ({ ...d, loyalty: { ...d.loyalty, [field]: val } })); setDirty(true); };
+  const setCred = (role, field, val) => { setDraft((d) => ({ ...d, credentials: { ...d.credentials, [role]: { ...d.credentials[role], [field]: val } } })); setDirty(true); };
+
+  const save = () => {
+    update((d) => { d.settings = structuredClone(draft); });
+    notify("Settings saved");
+    setDirty(false);
+  };
+  const discard = () => { setDraft(structuredClone(data.settings)); setDirty(false); };
 
   return (
     <div>
@@ -1311,16 +1397,20 @@ function SettingsTab({ data, update }) {
             <label className="field-label">Next receipt number</label>
             <input type="number" value={s.nextBillNo} onChange={(e) => set("nextBillNo", Number(e.target.value))} />
           </div>
+          <div className="settings-grid-full">
+            <label className="field-label">Receipt footer</label>
+            <input value={s.footer} onChange={(e) => set("footer", e.target.value)} />
+          </div>
         </div>
-        <label className="field-label">Receipt footer</label>
-        <input value={s.footer} onChange={(e) => set("footer", e.target.value)} />
       </SectionCard>
 
       <SectionCard title="Membership plan">
-        <div className="empty" style={{ marginBottom: 12 }}>These values drive every membership sold in Billing — change them anytime, existing members keep the terms they signed up under.</div>
-        <label className="field-label">Plan name</label>
-        <input value={plan.name} onChange={(e) => setPlan("name", e.target.value)} />
+        <div className="empty" style={{ marginBottom: 14 }}>These values drive every membership sold in Billing — change them anytime, existing members keep the terms they signed up under.</div>
         <div className="settings-grid">
+          <div className="settings-grid-full">
+            <label className="field-label">Plan name</label>
+            <input value={plan.name} onChange={(e) => setPlan("name", e.target.value)} />
+          </div>
           <div><label className="field-label">Price (₹)</label><input type="number" value={plan.price} onChange={(e) => setPlan("price", Number(e.target.value))} /></div>
           <div><label className="field-label">Validity (days)</label><input type="number" value={plan.validityDays} onChange={(e) => setPlan("validityDays", Number(e.target.value))} /></div>
           <div><label className="field-label">Service discount %</label><input type="number" value={plan.serviceDiscountPct} onChange={(e) => setPlan("serviceDiscountPct", Number(e.target.value))} /></div>
@@ -1328,11 +1418,11 @@ function SettingsTab({ data, update }) {
           <div><label className="field-label">Loyalty multiplier (×)</label><input type="number" value={plan.loyaltyMultiplier} onChange={(e) => setPlan("loyaltyMultiplier", Number(e.target.value))} /></div>
           <div><label className="field-label">Birthday discount (₹)</label><input type="number" value={plan.birthdayDiscount} onChange={(e) => setPlan("birthdayDiscount", Number(e.target.value))} /></div>
         </div>
-        <label className="membership-toggle on" style={{ marginTop: 6 }}>
+        <label className={"membership-toggle" + (plan.priorityBooking ? " on" : "")} style={{ marginTop: 8 }}>
           <input type="checkbox" checked={plan.priorityBooking} onChange={(e) => setPlan("priorityBooking", e.target.checked)} />
           <span>Priority booking for members</span>
         </label>
-        <label className="membership-toggle on">
+        <label className={"membership-toggle" + (plan.memberOnlyOffers ? " on" : "")}>
           <input type="checkbox" checked={plan.memberOnlyOffers} onChange={(e) => setPlan("memberOnlyOffers", e.target.checked)} />
           <span>Member-only offers</span>
         </label>
@@ -1345,21 +1435,29 @@ function SettingsTab({ data, update }) {
           <div><label className="field-label">Minimum redemption (points)</label><input type="number" value={loyalty.minRedemption} onChange={(e) => setLoyalty("minRedemption", Number(e.target.value))} /></div>
           <div><label className="field-label">Max redemption (% of bill)</label><input type="number" value={loyalty.maxRedemptionPct} onChange={(e) => setLoyalty("maxRedemptionPct", Number(e.target.value))} /></div>
         </div>
-        <div className="empty">Members earn {loyalty.pointsPer100 * plan.loyaltyMultiplier} points per ₹100 (regular customers earn {loyalty.pointsPer100}). {loyalty.redemptionPointsPerRupee} points = ₹1.</div>
+        <div className="empty" style={{ marginTop: 4 }}>Members earn {loyalty.pointsPer100 * plan.loyaltyMultiplier} points per ₹100 (regular customers earn {loyalty.pointsPer100}). {loyalty.redemptionPointsPerRupee} points = ₹1.</div>
       </SectionCard>
 
       <SectionCard title="Staff Logins">
-        <div className="empty" style={{ marginBottom: 12 }}>Set the username and password each role uses to sign in. Share these with the relevant staff — anyone signing in with these credentials gets that role's access.</div>
+        <div className="empty" style={{ marginBottom: 14 }}>Set the username and password each role uses to sign in. Share these with the relevant staff — anyone signing in with these credentials gets that role's access.</div>
         {["Admin", "Reception", "Stylist"].map((r) => (
           <div key={r} className="login-row">
             <div className="login-row-label">{r}</div>
-            <input placeholder="Username" value={s.credentials[r].username}
-              onChange={(e) => update((d) => { d.settings.credentials[r].username = e.target.value; })} />
-            <input placeholder="Password" value={s.credentials[r].password}
-              onChange={(e) => update((d) => { d.settings.credentials[r].password = e.target.value; })} />
+            <input placeholder="Username" value={s.credentials[r].username} onChange={(e) => setCred(r, "username", e.target.value)} />
+            <input placeholder="Password" value={s.credentials[r].password} onChange={(e) => setCred(r, "password", e.target.value)} />
           </div>
         ))}
       </SectionCard>
+
+      {dirty && (
+        <div className="save-bar">
+          <span>You have unsaved changes.</span>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button className="btn-ghost" onClick={discard}>Discard</button>
+            <button className="btn-primary" onClick={save}>Save Changes</button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1377,6 +1475,36 @@ function SectionCard({ title, children }) {
   return <div className="section-card"><div className="section-title">{title}</div>{children}</div>;
 }
 function Empty({ text }) { return <div className="empty">{text}</div>; }
+
+function CustomerPicker({ customers, value, onChange, placeholder }) {
+  const [query, setQuery] = useState("");
+  const [open, setOpen] = useState(false);
+  const selected = customers.find((c) => c.id === value);
+  const filtered = query
+    ? customers.filter((c) => c.name.toLowerCase().includes(query.toLowerCase()) || (c.phone || "").includes(query))
+    : customers;
+  const displayValue = open ? query : (selected ? `${selected.name}${selected.id !== "walkin" && selected.phone && selected.phone !== "-" ? ` — ${selected.phone}` : ""}` : "");
+  return (
+    <div className="cust-picker">
+      <input
+        placeholder={placeholder || "Search customer by name or phone"}
+        value={displayValue}
+        onFocus={() => { setOpen(true); setQuery(""); }}
+        onChange={(e) => setQuery(e.target.value)}
+        onBlur={() => setTimeout(() => setOpen(false), 150)}
+      />
+      {open && (
+        <div className="cust-picker-list">
+          {filtered.length === 0 ? <div className="cust-picker-empty">No matches</div> : filtered.map((c) => (
+            <div key={c.id} className="cust-picker-item" onMouseDown={() => { onChange(c.id); setOpen(false); setQuery(""); }}>
+              {c.name}{c.id !== "walkin" && c.phone && c.phone !== "-" ? ` — ${c.phone}` : ""}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
 
 function ModalShell({ title, onClose, children, onSave, saveLabel = "Save", disabled, hint }) {
   return (
@@ -1433,20 +1561,35 @@ function CustomerModal({ onClose, onSave, initial }) {
   );
 }
 
-function AppointmentModal({ data, onClose, onSave }) {
+function AppointmentModal({ data, onClose, onSave, onQuickAddCustomer }) {
+  const bookableCustomers = data.customers.filter((c) => c.id !== "walkin");
   const [f, setF] = useState({
     date: todayISO(), time: "09:00",
-    customer: data.customers.find((c) => c.id === "walkin")?.name || data.customers[0]?.name || "",
+    customerId: bookableCustomers[0]?.id || "",
     service: data.services[0]?.name || "", stylist: data.employees[0]?.name || "",
   });
+  const [showNew, setShowNew] = useState(false);
+  const [newCust, setNewCust] = useState({ name: "", phone: "", gender: "" });
+
   const noServices = data.services.length === 0;
   const noStaff = data.employees.length === 0;
-  const isValid = f.date && f.time && f.customer && f.service && f.stylist;
+  const noCustomers = bookableCustomers.length === 0;
+  const selectedCustomer = bookableCustomers.find((c) => c.id === f.customerId);
+  const isValid = f.date && f.time && selectedCustomer && f.service && f.stylist;
+
+  const addAndSelect = () => {
+    if (!newCust.name.trim() || !newCust.phone.trim() || !newCust.gender) return;
+    const id = onQuickAddCustomer(newCust);
+    setF({ ...f, customerId: id });
+    setShowNew(false);
+    setNewCust({ name: "", phone: "", gender: "" });
+  };
+
   return (
     <ModalShell
       title="New Appointment"
       onClose={onClose}
-      onSave={() => isValid && onSave(f)}
+      onSave={() => isValid && onSave({ date: f.date, time: f.time, customer: selectedCustomer.name, service: f.service, stylist: f.stylist })}
       disabled={!isValid}
       hint={noServices ? "Add a service first (Services tab)." : noStaff ? "Add an employee first (Employees tab)." : "Date, time, customer, service and stylist are all required."}
     >
@@ -1457,9 +1600,29 @@ function AppointmentModal({ data, onClose, onSave }) {
       <input type="time" value={f.time} onChange={(e) => setF({ ...f, time: e.target.value })} />
 
       <label className="field-label">Customer <span className="req">*</span></label>
-      <select value={f.customer} onChange={(e) => setF({ ...f, customer: e.target.value })}>
-        {data.customers.map((c) => <option key={c.id} value={c.name}>{c.name}</option>)}
-      </select>
+      {!showNew ? (
+        <>
+          {noCustomers ? (
+            <div className="qr-note" style={{ marginBottom: 10 }}>No customers yet — add one below.</div>
+          ) : (
+            <CustomerPicker customers={bookableCustomers} value={f.customerId} onChange={(id) => setF({ ...f, customerId: id })} />
+          )}
+          <button type="button" className="btn-ghost" style={{ marginTop: 8, marginBottom: 12 }} onClick={() => setShowNew(true)}><Plus size={13} />New customer</button>
+        </>
+      ) : (
+        <div className="inline-new-customer">
+          <input placeholder="Name" value={newCust.name} onChange={(e) => setNewCust({ ...newCust, name: e.target.value })} />
+          <input placeholder="Mobile number" value={newCust.phone} onChange={(e) => setNewCust({ ...newCust, phone: e.target.value })} />
+          <select value={newCust.gender} onChange={(e) => setNewCust({ ...newCust, gender: e.target.value })}>
+            <option value="">Select gender…</option>
+            <option>Female</option><option>Male</option><option>Other</option>
+          </select>
+          <div className="row-2">
+            <button type="button" className="btn-ghost" onClick={() => setShowNew(false)}>Cancel</button>
+            <button type="button" className="btn-primary" disabled={!newCust.name.trim() || !newCust.phone.trim() || !newCust.gender} onClick={addAndSelect}>Add & Select</button>
+          </div>
+        </div>
+      )}
 
       <label className="field-label">Service <span className="req">*</span></label>
       <select value={f.service} onChange={(e) => setF({ ...f, service: e.target.value })} disabled={noServices}>
@@ -1812,8 +1975,29 @@ function Style() {
       .badge-expired { background:var(--line); color:var(--ink-soft); }
       .adjust-row { display:flex; gap:6px; margin:8px 0; flex-wrap:wrap; }
       .adjust-row input { flex:1; min-width:80px; padding:7px 9px; border:1px solid var(--line); border-radius:6px; font-size:12px; font-family:var(--font-ui); }
-      .settings-grid { display:grid; grid-template-columns:1fr 1fr; gap:0 14px; }
+      .settings-grid { display:grid; grid-template-columns:1fr 1fr; gap:16px 14px; align-items:start; }
       .settings-grid > div { display:flex; flex-direction:column; }
+      .settings-grid-full { grid-column:1 / -1; display:flex; flex-direction:column; }
+      .section-card input:not([type="checkbox"]), .section-card select, .section-card textarea { width:100%; box-sizing:border-box; padding:9px 11px; border:1px solid var(--line); border-radius:8px; font-family:var(--font-ui); font-size:13px; background:var(--paper); }
+      .section-card .login-row input { padding:8px 10px; border-radius:7px; font-size:12.5px; }
+      .save-bar { position:sticky; bottom:16px; margin-top:20px; background:var(--wine-deep); color:var(--cream); border-radius:12px; padding:14px 18px; display:flex; justify-content:space-between; align-items:center; font-family:var(--font-ui); font-size:13px; box-shadow:0 12px 30px rgba(42,34,38,.3); z-index:10; }
+      .save-bar .btn-primary { background:var(--gold); color:var(--wine-deep); }
+      .save-bar .btn-ghost { color:var(--cream); border-color:rgba(248,244,238,.35); }
+      .save-bar .btn-ghost:hover { background:rgba(248,244,238,.12); }
+      .cust-picker { position:relative; }
+      .cust-picker-list { position:absolute; top:calc(100% + 4px); left:0; right:0; background:var(--paper); border:1px solid var(--line); border-radius:8px; max-height:220px; overflow-y:auto; z-index:30; box-shadow:0 12px 30px rgba(42,34,38,.18); }
+      .cust-picker-item { padding:9px 12px; font-family:var(--font-ui); font-size:12.5px; cursor:pointer; }
+      .cust-picker-item:hover { background:var(--wine-soft); }
+      .cust-picker-empty { padding:9px 12px; font-family:var(--font-ui); font-size:12px; color:var(--ink-soft); font-style:italic; }
+      .reports-controls { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+      .reports-controls select, .reports-controls input { padding:8px 10px; border:1px solid var(--line); border-radius:8px; background:var(--paper); font-family:var(--font-ui); font-size:12.5px; }
+      .reports-controls .btn-primary { padding:8px 14px; white-space:nowrap; }
+      .birthday-list { display:flex; flex-direction:column; gap:6px; }
+      .birthday-row { display:flex; justify-content:space-between; align-items:center; background:var(--paper); border:1px solid var(--line); border-radius:8px; padding:9px 13px; font-family:var(--font-ui); }
+      .birthday-name { font-size:13px; font-weight:600; }
+      .birthday-date { font-size:11px; color:var(--ink-soft); }
+      .inline-new-customer { background:var(--wine-soft); border:1px solid var(--gold); border-radius:8px; padding:12px; margin-bottom:12px; }
+      .inline-new-customer input, .inline-new-customer select { margin-bottom:8px; }
       .profile-head { display:flex; align-items:center; gap:12px; margin-bottom:16px; padding-bottom:14px; border-bottom:1px solid var(--line); }
       .profile-mark { width:44px; height:44px; border-radius:50%; background:var(--wine); color:var(--cream); font-family:var(--font-display); font-size:19px; font-weight:600; display:flex; align-items:center; justify-content:center; flex-shrink:0; }
       .profile-head-name { font-family:var(--font-display); font-size:16px; font-weight:600; color:var(--wine-deep); }
