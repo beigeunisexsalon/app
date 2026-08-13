@@ -118,6 +118,61 @@ function buildReceiptText(receipt, settings) {
   ].filter(Boolean);
   return lines.join("\n");
 }
+
+// Minimal dependency-free PDF writer for the receipt. No external library needed
+// (keeps this working both in the in-chat preview and the deployed site).
+// Only plain ASCII is safe inside a non-embedded-font PDF, so non-ASCII characters
+// are substituted with "?" and ₹ is written as "Rs." to avoid corrupt glyphs.
+function toPdfAscii(s) { return String(s).replace(/[^\x20-\x7E]/g, "?"); }
+function rsAscii(n) { return "Rs." + Number(n || 0).toLocaleString("en-IN"); }
+function buildReceiptPdfBlob(receipt, settings) {
+  const pad = (s, n) => (s.length >= n ? s + " " : s + " ".repeat(n - s.length));
+  const lines = [];
+  lines.push(toPdfAscii(settings.salonName));
+  lines.push(`Receipt #${receipt.billNo}   ${receipt.date}`);
+  lines.push(`Customer: ${toPdfAscii(receipt.customer)}`);
+  lines.push("--------------------------------");
+  receipt.items.forEach((i) => lines.push(pad(toPdfAscii(`${i.name} x${i.qty}`), 22) + rsAscii(i.price * i.qty)));
+  lines.push("--------------------------------");
+  lines.push(pad("Subtotal", 22) + rsAscii(receipt.subtotal));
+  if (receipt.membershipDiscount) lines.push(pad("Member discount", 22) + "-" + rsAscii(receipt.membershipDiscount));
+  if (receipt.birthdayDiscount) lines.push(pad("Birthday discount", 22) + "-" + rsAscii(receipt.birthdayDiscount));
+  if (receipt.loyaltyRedeemedValue) lines.push(pad("Loyalty redeemed", 22) + "-" + rsAscii(receipt.loyaltyRedeemedValue));
+  if (receipt.discount) lines.push(pad("Discount", 22) + "-" + rsAscii(receipt.discount));
+  lines.push(pad("GST", 22) + rsAscii(receipt.gst));
+  lines.push(pad("TOTAL", 22) + rsAscii(receipt.total));
+  lines.push("");
+  lines.push(`Payment mode: ${receipt.paymentMethod}`);
+  if (receipt.pointsEarned) lines.push(`Loyalty points earned: +${receipt.pointsEarned}`);
+  lines.push("");
+  lines.push(toPdfAscii(settings.footer || ""));
+
+  const leading = 13, marginTop = 26, marginBottom = 20, width = 260;
+  const height = marginTop + marginBottom + lines.length * leading;
+  const esc = (s) => s.replace(/\\/g, "\\\\").replace(/\(/g, "\\(").replace(/\)/g, "\\)");
+
+  let content = `BT\n/F1 9 Tf\n${leading} TL\n10 ${height - marginTop} Td\n`;
+  lines.forEach((line) => { content += `(${esc(line)}) Tj\nT*\n`; });
+  content += "ET";
+
+  const objects = [
+    "<< /Type /Catalog /Pages 2 0 R >>",
+    "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${width} ${height}] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>`,
+    "<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>",
+    `<< /Length ${content.length} >>\nstream\n${content}\nendstream`,
+  ];
+
+  let pdf = "%PDF-1.4\n";
+  const offsets = [0];
+  objects.forEach((obj, i) => { offsets.push(pdf.length); pdf += `${i + 1} 0 obj\n${obj}\nendobj\n`; });
+  const xrefStart = pdf.length;
+  pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  for (let i = 1; i <= objects.length; i++) pdf += String(offsets[i]).padStart(10, "0") + " 00000 n \n";
+  pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefStart}\n%%EOF`;
+
+  return new Blob([pdf], { type: "application/pdf" });
+}
 function isMemberActive(c, today) { return !!(c && c.membershipExpiry && c.membershipExpiry >= (today || todayISO())); }
 function membershipStatusLabel(c) {
   if (!c || !c.membershipExpiry) return "None";
@@ -814,6 +869,40 @@ function ReceiptModal({ receipt, settings, onClose, notify }) {
   const message = buildReceiptText(receipt, settings);
   const waLink = `https://wa.me/${phoneDigits}?text=${encodeURIComponent(message)}`;
   const smsLink = `sms:+${phoneDigits}?body=${encodeURIComponent(message)}`;
+  const pdfFilename = `Receipt-${receipt.billNo}.pdf`;
+
+  const downloadPdf = () => {
+    const blob = buildReceiptPdfBlob(receipt, settings);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = pdfFilename;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const isMobileDevice = () => /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+
+  const shareReceipt = async () => {
+    const blob = buildReceiptPdfBlob(receipt, settings);
+    const file = new File([blob], pdfFilename, { type: "application/pdf" });
+    // Native file-sharing to WhatsApp only actually works on phones/tablets — WhatsApp
+    // Desktop (Mac/Windows) doesn't register itself as a system share target for files,
+    // so the OS share sheet would show Mail/Messages/Notes but never WhatsApp there.
+    if (isMobileDevice() && navigator.canShare && navigator.canShare({ files: [file] })) {
+      try {
+        await navigator.share({ files: [file], title: `Receipt #${receipt.billNo}`, text: `Receipt from ${settings.salonName}` });
+        notify && notify("Receipt shared");
+        return;
+      } catch (err) {
+        if (err && err.name === "AbortError") return; // user cancelled the share sheet
+      }
+    }
+    // Desktop path: download the PDF and open the exact WhatsApp chat, since a link
+    // can never auto-attach a file and WhatsApp Desktop won't accept it via share sheet.
+    downloadPdf();
+    if (canSend) window.open(waLink, "_blank");
+    notify && notify("PDF downloaded — attach it in the WhatsApp chat that just opened");
+  };
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
@@ -845,15 +934,17 @@ function ReceiptModal({ receipt, settings, onClose, notify }) {
           <div className="receipt-footer">{settings.footer}</div>
         </div>
         <button className="btn-primary full" onClick={() => { window.print(); notify && notify("Receipt generated & sent to printer"); }}><Printer size={15} />Print</button>
+        <button className="btn-ghost full" style={{ marginTop: 8 }} onClick={downloadPdf}><FileText size={14} />Download PDF</button>
         {canSend ? (
-          <div className="send-row">
-            <a className="btn-ghost send-btn" href={waLink} target="_blank" rel="noopener noreferrer" onClick={() => notify && notify("Opening WhatsApp to send the bill")}>
-              <MessageCircle size={14} />WhatsApp
-            </a>
-            <a className="btn-ghost send-btn" href={smsLink} onClick={() => notify && notify("Opening Messages to send the bill")}>
-              <Smartphone size={14} />SMS
-            </a>
-          </div>
+          <>
+            <div className="send-row" style={{ marginTop: 8 }}>
+              <button className="btn-ghost send-btn" onClick={shareReceipt}><MessageCircle size={14} />Share PDF via WhatsApp</button>
+              <a className="btn-ghost send-btn" href={smsLink} onClick={() => notify && notify("Opening Messages with the bill as text")}>
+                <Smartphone size={14} />SMS (text)
+              </a>
+            </div>
+            <div className="qr-note" style={{ marginTop: 6 }}>On a phone/tablet, "Share PDF" hands the file straight to WhatsApp. On a computer, WhatsApp Desktop doesn't accept files from the browser's share sheet at all — so here it downloads the PDF and opens the customer's WhatsApp chat for you; just drag the downloaded file in. SMS can only ever send text, never a file, on any device.</div>
+          </>
         ) : (
           <div className="qr-note" style={{ marginTop: 8 }}>No valid phone number on file — add one to this customer's profile to send bills directly.</div>
         )}
