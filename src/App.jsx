@@ -880,10 +880,15 @@ function ReceiptModal({ receipt, settings, onClose, notify }) {
     URL.revokeObjectURL(url);
   };
 
+  const isMobileDevice = () => /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+
   const shareReceipt = async () => {
     const blob = buildReceiptPdfBlob(receipt, settings);
     const file = new File([blob], pdfFilename, { type: "application/pdf" });
-    if (navigator.canShare && navigator.canShare({ files: [file] })) {
+    // Native file-sharing to WhatsApp only actually works on phones/tablets — WhatsApp
+    // Desktop (Mac/Windows) doesn't register itself as a system share target for files,
+    // so the OS share sheet would show Mail/Messages/Notes but never WhatsApp there.
+    if (isMobileDevice() && navigator.canShare && navigator.canShare({ files: [file] })) {
       try {
         await navigator.share({ files: [file], title: `Receipt #${receipt.billNo}`, text: `Receipt from ${settings.salonName}` });
         notify && notify("Receipt shared");
@@ -892,8 +897,8 @@ function ReceiptModal({ receipt, settings, onClose, notify }) {
         if (err && err.name === "AbortError") return; // user cancelled the share sheet
       }
     }
-    // Fallback for browsers that can't share files (mostly desktop): download the PDF
-    // and open WhatsApp with a text message, since a link can never auto-attach a file.
+    // Desktop path: download the PDF and open the exact WhatsApp chat, since a link
+    // can never auto-attach a file and WhatsApp Desktop won't accept it via share sheet.
     downloadPdf();
     if (canSend) window.open(waLink, "_blank");
     notify && notify("PDF downloaded — attach it in the WhatsApp chat that just opened");
@@ -938,7 +943,7 @@ function ReceiptModal({ receipt, settings, onClose, notify }) {
                 <Smartphone size={14} />SMS (text)
               </a>
             </div>
-            <div className="qr-note" style={{ marginTop: 6 }}>On phone/tablet, "Share PDF" opens the share sheet with the real receipt attached — pick WhatsApp there. On desktop it downloads the PDF and opens WhatsApp for you to attach manually. SMS can only ever send text, never a file.</div>
+            <div className="qr-note" style={{ marginTop: 6 }}>On a phone/tablet, "Share PDF" hands the file straight to WhatsApp. On a computer, WhatsApp Desktop doesn't accept files from the browser's share sheet at all — so here it downloads the PDF and opens the customer's WhatsApp chat for you; just drag the downloaded file in. SMS can only ever send text, never a file, on any device.</div>
           </>
         ) : (
           <div className="qr-note" style={{ marginTop: 8 }}>No valid phone number on file — add one to this customer's profile to send bills directly.</div>
